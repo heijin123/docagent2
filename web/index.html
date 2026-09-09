@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智能问答 · Enterprise-QA-Agent</title>
+  <link rel="stylesheet" href="common.css" />
+  <style>
+    .layout { display: flex; gap: 20px; align-items: flex-start; }
+    .chat-col { flex: 1; min-width: 0; }
+    .side-col { width: 280px; flex-shrink: 0; position: sticky; top: 76px; }
+
+    .chat-log {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      height: 56vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .msg { display: flex; gap: 10px; }
+    .msg .avatar {
+      width: 30px; height: 30px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; font-weight: 700; flex-shrink: 0;
+    }
+    .msg.user .avatar { background: var(--accent); color: #fff; }
+    .msg.assistant .avatar { background: var(--bg-elev); color: var(--accent); border: 1px solid var(--border-strong); }
+    .msg .bubble { flex: 1; min-width: 0; }
+    .msg .who { font-size: 12px; color: var(--text-faint); margin-bottom: 2px; }
+    .msg.user .content {
+      background: var(--bg-elev);
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg.assistant .content {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.75;
+    }
+    .msg.assistant .content .streaming-cursor {
+      display: inline-block; width: 8px; height: 15px;
+      background: var(--accent); margin-left: 2px;
+      vertical-align: text-bottom; animation: blink 1s infinite;
+    }
+    @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+
+    .citations { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .cite {
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: var(--radius-sm);
+      padding: 8px 12px;
+      font-size: 13px;
+      background: var(--bg-input);
+    }
+    .cite.expired { border-left-color: var(--amber); }
+    .cite .cite-title { font-weight: 600; color: var(--text); }
+    .cite .cite-meta { color: var(--text-faint); font-size: 12px; margin-top: 2px; }
+
+    .meta-bar {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
+    .composer {
+      margin-top: 16px;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .composer textarea { min-height: 70px; }
+    .composer .actions { display: flex; align-items: center; gap: 10px; }
+    .composer .opts { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 13px; }
+    .composer .opts label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+
+    .side-card { margin-bottom: 16px; }
+    .side-card h3 { margin: 0 0 10px; font-size: 13px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+    .health-item { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; font-size: 13px; }
+    .health-item .name { color: var(--text-dim); }
+    .history-list { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+    .history-item { padding: 8px 10px; border-radius: var(--radius-sm); background: var(--bg-input); cursor: pointer; font-size: 13px; }
+    .history-item:hover { background: var(--bg-elev); }
+    .history-item .h-q { color: var(--text); }
+    .history-item .h-a { color: var(--text-faint); font-size: 12px; margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+    .empty-hint { color: var(--text-faint); text-align: center; padding: 40px 20px; }
+    .empty-hint .big { font-size: 40px; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Enterprise<span>QA</span> Agent</div>
+    <nav>
+      <a href="index.html" class="active">智能问答</a>
+      <a href="upload.html">文档管理</a>
+    </nav>
+    <div class="status">
+      <span class="dot" id="healthDot"></span>
+      <span id="healthText">检测中…</span>
+    </div>
+  </header>
+
+  <div class="page" style="max-width: 1200px;">
+    <div class="layout">
+      <!-- 主对话区 -->
+      <div class="chat-col">
+        <div class="chat-log" id="chatLog">
+          <div class="empty-hint">
+            <div class="big">💬</div>
+            <div>向知识库提问，回答将流式呈现</div>
+            <div class="faint mt-8">支持报销、考勤、请假等企业制度问答</div>
+          </div>
+        </div>
+
+        <div class="composer">
+          <textarea id="questionInput" placeholder="输入你的问题，Ctrl+Enter 发送…" rows="3"></textarea>
+          <div class="actions">
+            <button class="btn primary" id="sendBtn">发送</button>
+            <button class="btn ghost" id="stopBtn" disabled>停止</button>
+            <div class="opts">
+              <label><input type="checkbox" id="streamToggle" checked /> 流式</label>
+              <label><input type="checkbox" id="expiredToggle" /> 包含过期资料</label>
+            </div>
+            <div class="spacer"></div>
+            <span class="faint" style="font-size: 12px;">thread: <span class="mono" id="threadLabel"></span></span>
+            <button class="btn sm ghost" id="resetThreadBtn" title="清空上下文，开启新会话">新会话</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 侧栏 -->
+      <div class="side-col">
+        <div class="card side-card">
+          <h3>服务状态</h3>
+          <div id="healthList"></div>
+        </div>
+        <div class="card side-card">
+          <h3>对话历史</h3>
+          <div class="history-list" id="historyList">
+            <div class="faint" style="padding:10px;">暂无历史</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="common.js"></script>
+  <script>
+    (function () {
+      const $ = (id) => document.getElementById(id);
+      const chatLog = $("chatLog");
+      const qInput = $("questionInput");
+      const sendBtn = $("sendBtn");
+      const stopBtn = $("stopBtn");
+      let aborted = false;
+      let currentStream = null;
+
+      // thread 标签
+      $("threadLabel").textContent = QA.threadId();
+
+      // 健康检查
+      async function refreshHealth() {
+        const h = await QA.checkHealth();
+        const dot = $("healthDot"), txt = $("healthText");
+        if (h.http === 0) {
+          dot.className = "dot down"; txt.textContent = "服务不可达";
+          $("healthList").innerHTML = '<div class="faint">无法连接后端</div>';
+          return;
+        }
+        const status = h.data && h.data.status;
+        dot.className = "dot " + (status === "ok" ? "ok" : "degraded");
+        txt.textContent = status === "ok" ? "正常" : "降级运行";
+        const checks = (h.data && h.data.checks) || {};
+        const labels = { vector_store: "向量库", bm25: "关键词索引", redis: "Redis 记忆", llm: "LLM" };
+        $("healthList").innerHTML = Object.entries(checks).map(([k, v]) => {
+          const cls = v === "up" ? "ok" : (v === "down" ? "err" : "warn");
+          return '<div class="health-item"><span class="name">' + (labels[k] || k) + '</span>' +
+            '<span class="badge ' + cls + '">' + v + '</span></div>';
+        }).join("");
+      }
+      refreshHealth();
+      setInterval(refreshHealth, 15000);
+
+      // 追加消息
+      function appendMsg(role, who) {
+        chatLog.querySelector(".empty-hint")?.remove();
+        const el = document.createElement("div");
+        el.className = "msg " + role;
+        el.innerHTML = '<div class="avatar">' + (role === "user" ? "你" : "AI") + '</div>' +
+          '<div class="bubble"><div class="who">' + who + '</div>' +
+          '<div class="content"></div><div class="citations"></div><div class="meta-bar"></div></div>';
+        chatLog.appendChild(el);
+        chatLog.scrollTop = chatLog.scrollHeight;
+        return el;
+      }
+      function scrollBottom() { chatLog.scrollTop = chatLog.scrollHeight; }
+
+      // 发送
+      async function send() {
+        const q = qInput.value.trim();
+        if (!q || sendBtn.disabled) return;
+        qInput.value = "";
+        aborted = false;
+        sendBtn.disabled = true;
+        stopBtn.disabled = false;
+
+        const userMsg = appendMsg("user", "我");
+        userMsg.querySelector(".content").textContent = q;
+
+        const aiMsg = appendMsg("assistant", "正在思考…");
+        const contentEl = aiMsg.querySelector(".content");
+        const citeEl = aiMsg.querySelector(".citations");
+        const metaEl = aiMsg.querySelector(".meta-bar");
+        contentEl.textContent = "";
+
+        const stream = $("streamToggle").checked;
+        const includeExpired = $("expiredToggle").checked;
+        let answer = "";
+
+        try {
+          currentStream = QA.streamChat(q, {
+            stream, includeExpired,
+            onEvent: (ev) => {
+              if (aborted) return;
+              if (ev.type === "token") {
+                answer += ev.data.content || "";
+                contentEl.innerHTML = QA.esc(answer) + '<span class="streaming-cursor"></span>';
+                scrollBottom();
+              } else if (ev.type === "citation") {
+                const c = ev.data;
+                const cls = c.validity === "expired" ? "cite expired" : "cite";
+                citeEl.innerHTML += '<div class="' + cls + '">' +
+                  '<div class="cite-title">' + QA.esc(c.doc_title || "未命名文档") +
+                  (c.page_num ? ' <span class="faint">第 ' + c.page_num + ' 页</span>' : "") + '</div>' +
+                  '<div class="cite-meta mono">' + QA.esc(c.chunk_id || "") +
+                  (c.validity === "expired" ? ' <span class="badge warn">过期</span>' : "") + '</div>' +
+                  '</div>';
+              } else if (ev.type === "done") {
+                const d = ev.data;
+                answer = d.answer || answer;
+                contentEl.innerHTML = QA.esc(answer);
+                const confPct = Math.round((d.confidence || 0) * 100);
+                const confCls = confPct >= 70 ? "ok" : (confPct >= 40 ? "warn" : "err");
+                metaEl.innerHTML =
+                  '<span class="badge">意图 ' + QA.esc(d.intent || "kb_qa") + '</span>' +
+                  '<span class="badge ' + confCls + '">置信 ' + confPct + '%</span>' +
+                  '<span class="badge info">耗时 ' + QA.fmtMs(d.latency_ms) + '</span>' +
+                  (d.degraded ? '<span class="badge warn">降级</span>' : '') +
+                  '<span class="faint" style="font-size:12px;">' + (d.notes || []).map(QA.esc).join(" · ") + '</span>';
+                finish();
+              } else if (ev.type === "error") {
+                contentEl.innerHTML = '<span style="color:var(--red)">生成出错：' + QA.esc(ev.data.message || "未知错误") + '</span>';
+                finish();
+              }
+            },
+          });
+          await currentStream;
+        } catch (e) {
+          contentEl.innerHTML = '<span style="color:var(--red)">请求失败：' + QA.esc(e.message) + '</span>';
+          finish();
+        }
+      }
+
+      function finish() {
+        sendBtn.disabled = false;
+        stopBtn.disabled = true;
+        currentStream = null;
+        scrollBottom();
+        loadHistory();
+      }
+
+      // 停止
+      stopBtn.onclick = () => {
+        aborted = true;
+        if (currentStream && currentStream.abort) currentStream.abort();
+        // 标记已停止
+        const last = chatLog.querySelector(".msg.assistant:last-of-type .content");
+        if (last && !last.textContent) last.textContent = "（已停止）";
+        finish();
+      };
+
+      // 发送触发
+      sendBtn.onclick = send;
+      qInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+      });
+
+      // 新会话
+      $("resetThreadBtn").onclick = () => {
+        QA.resetThread();
+        $("threadLabel").textContent = QA.threadId();
+        chatLog.innerHTML = '<div class="empty-hint"><div class="big">💬</div><div>已开启新会话</div></div>';
+        $("historyList").innerHTML = '<div class="faint" style="padding:10px;">暂无历史</div>';
+      };
+
+      // 加载历史
+      async function loadHistory() {
+        try {
+          const msgs = await QA.getHistory(20);
+          const list = $("historyList");
+          if (!msgs.length) {
+            list.innerHTML = '<div class="faint" style="padding:10px;">暂无历史</div>';
+            return;
+          }
+          list.innerHTML = msgs.slice().reverse().map((m) => {
+            if (m.role === "user") return '<div class="history-item"><div class="h-q">🙋 ' + QA.esc(m.content) + '</div></div>';
+            return '<div class="history-item"><div class="h-a">' + QA.esc(m.content) + '</div></div>';
+          }).join("");
+        } catch (e) { /* 忽略历史加载错误 */ }
+      }
+      loadHistory();
+    })();
+  </script>
+</body>
+</html>

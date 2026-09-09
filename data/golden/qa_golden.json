@@ -1,0 +1,102 @@
+{
+  "meta": {
+    "schema": "1.0",
+    "description": "Enterprise-QA-Agent golden 评估集：query → 期望文档 + 锚句（锚句用于全库定位期望块，零人工标注块 id）",
+    "created": "2026-09-09",
+    "tenant_id": "tenant_demo",
+    "note": "锚句必须是入库 chunk 中的原文片段（归一化后子串匹配）；三类问题：语义类 / 精确编号类 / 跨年份类"
+  },
+  "cases": [
+    {
+      "id": "q001",
+      "query": "上班最晚几点打卡？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "上班时间不晚于 09:30",
+      "type": "semantic"
+    },
+    {
+      "id": "q002",
+      "query": "报销单编号规则是什么？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "报销单编号规则：XB- 开头",
+      "type": "exact"
+    },
+    {
+      "id": "q003",
+      "query": "差旅报销每天的上限是多少？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "差旅 | 500/天",
+      "type": "exact"
+    },
+    {
+      "id": "q004",
+      "query": "多少钱以上的报销需要总监审批？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "报销 5000 元以上需总监审批",
+      "type": "semantic"
+    },
+    {
+      "id": "q005",
+      "query": "系统支持哪些格式的文档入库？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "支持 PDF、Word、Markdown 与纯文本格式",
+      "type": "semantic"
+    },
+    {
+      "id": "q006",
+      "query": "年假可以跨年累计多少天？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "年假按自然年计算，可跨年累计不超过 5 天",
+      "type": "semantic"
+    },
+    {
+      "id": "q007",
+      "query": "请假需要提前多久提交申请？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "请假需提前一天在系统提交申请",
+      "type": "semantic"
+    },
+    {
+      "id": "q008",
+      "query": "病假超过 3 天由谁审批？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "病假(>3天) | 部门总监",
+      "type": "exact"
+    },
+    {
+      "id": "q009",
+      "query": "营收同比增长了多少？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "营收同比增长 12%",
+      "type": "exact"
+    },
+    {
+      "id": "q010",
+      "query": "毛利提升到了多少？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "毛利提升至 28%",
+      "type": "exact"
+    },
+    {
+      "id": "q011",
+      "query": "2024 年的考勤制度是怎么规定的？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "考勤周期为自然月",
+      "type": "year"
+    },
+    {
+      "id": "q012",
+      "query": "考勤周期是按什么计算的？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "考勤周期为自然月",
+      "type": "semantic"
+    },
+    {
+      "id": "q013",
+      "query": "员工手册里打卡规则有哪些要求？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "一天至少打卡两次",
+      "type": "semantic"
+    }
+  ]
+}

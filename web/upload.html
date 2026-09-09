@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>文档管理 · Enterprise-QA-Agent</title>
+  <link rel="stylesheet" href="common.css" />
+  <style>
+    .dropzone {
+      border: 2px dashed var(--border-strong);
+      border-radius: var(--radius);
+      padding: 40px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      color: var(--text-dim);
+    }
+    .dropzone:hover, .dropzone.drag { border-color: var(--accent); background: var(--bg-elev); }
+    .dropzone .dz-icon { font-size: 42px; margin-bottom: 8px; }
+    .dropzone .dz-hint { font-size: 12px; color: var(--text-faint); margin-top: 6px; }
+
+    .upload-grid { display: flex; flex-direction: column; gap: 12px; margin-top: 20px; }
+    .upload-item {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+    }
+    .upload-item .ui-head { display: flex; align-items: center; gap: 10px; }
+    .upload-item .ui-name { font-weight: 600; word-break: break-all; }
+    .upload-item .ui-size { color: var(--text-faint); font-size: 12px; }
+    .upload-item .ui-actions { margin-left: auto; display: flex; gap: 6px; }
+
+    .progress-track {
+      height: 8px; background: var(--bg-input);
+      border-radius: 6px; overflow: hidden; margin-top: 10px;
+    }
+    .progress-fill {
+      height: 100%; background: var(--accent);
+      border-radius: 6px; transition: width 0.3s;
+    }
+    .progress-fill.done { background: var(--green); }
+    .progress-fill.failed { background: var(--red); }
+
+    .phase-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .phase-tag {
+      font-size: 11px; padding: 3px 8px; border-radius: 4px;
+      background: var(--bg-input); color: var(--text-faint);
+      border: 1px solid var(--border);
+    }
+    .phase-tag.active { color: var(--accent); border-color: var(--accent); }
+    .phase-tag.done { color: var(--green); border-color: rgba(63,185,106,0.4); }
+    .phase-tag.failed { color: var(--red); border-color: rgba(224,91,91,0.4); }
+
+    .warnings { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+    .warning { font-size: 12px; color: var(--amber); }
+
+    .meta-form { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .meta-form .field { flex: 1; min-width: 140px; }
+    .meta-form label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+
+    .summary-bar {
+      margin-top: 16px; padding: 12px 16px;
+      background: var(--bg-elev); border-radius: var(--radius-sm);
+      display: flex; align-items: center; gap: 16px; font-size: 13px; color: var(--text-dim);
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Enterprise<span>QA</span> Agent</div>
+    <nav>
+      <a href="index.html">智能问答</a>
+      <a href="upload.html" class="active">文档管理</a>
+    </nav>
+    <div class="status">
+      <span class="dot" id="healthDot"></span>
+      <span id="healthText">检测中…</span>
+    </div>
+  </header>
+
+  <div class="page">
+    <h1>文档管理</h1>
+    <p class="sub">上传文档 → 异步入库（并发）→ 后台清洗切片（解析 / 切片 / 向量化 / 索引）</p>
+
+    <!-- 拖拽上传区 -->
+    <div class="dropzone" id="dropzone">
+      <div class="dz-icon">📄</div>
+      <div>点击或拖拽文件到此处上传</div>
+      <div class="dz-hint">支持 PDF / DOCX / Markdown / TXT，可多文件并发上传</div>
+      <input type="file" id="fileInput" multiple accept=".pdf,.docx,.md,.txt" style="display:none;" />
+    </div>
+
+    <!-- 元数据 -->
+    <div class="card mt-16">
+      <div class="meta-form">
+        <div class="field">
+          <label>文档键 doc_key（可选，不填取文件名）</label>
+          <input type="text" id="metaDocKey" placeholder="如 policy/报销制度-v3" />
+        </div>
+        <div class="field">
+          <label>部门 department</label>
+          <select id="metaDept"></select>
+        </div>
+        <div class="field">
+          <label>分类 category</label>
+          <select id="metaCategory"></select>
+        </div>
+      </div>
+    </div>
+
+    <!-- 汇总 -->
+    <div class="summary-bar" id="summaryBar" style="display:none;"></div>
+
+    <!-- 上传队列 -->
+    <div class="upload-grid" id="uploadGrid"></div>
+  </div>
+
+  <script src="common.js"></script>
+  <script>
+    (function () {
+      const $ = (id) => document.getElementById(id);
+      const dropzone = $("dropzone");
+      const fileInput = $("fileInput");
+      const grid = $("uploadGrid");
+      const summaryBar = $("summaryBar");
+
+      // 阶段定义（与后端 pipeline 对齐：parse/chunk/embed/index）
+      const PHASES = [
+        { key: "parse", label: "解析" },
+        { key: "chunk", label: "切片" },
+        { key: "embed", label: "向量化" },
+        { key: "index", label: "索引" },
+      ];
+
+      // 活跃任务记录：taskId -> { el 引用 }
+      const active = new Map();
+
+      // 健康检查
+      async function refreshHealth() {
+        const h = await QA.checkHealth();
+        const dot = $("healthDot"), txt = $("healthText");
+        if (h.http === 0) { dot.className = "dot down"; txt.textContent = "服务不可达"; return; }
+        const status = h.data && h.data.status;
+        dot.className = "dot " + (status === "ok" ? "ok" : "degraded");
+        txt.textContent = status === "ok" ? "正常" : "降级运行";
+      }
+      refreshHealth();
+      setInterval(refreshHealth, 15000);
+
+      // 拖拽交互
+      dropzone.onclick = () => fileInput.click();
+      dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("drag"); });
+      dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
+      dropzone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropzone.classList.remove("drag");
+        handleFiles(e.dataTransfer.files);
+      });
+      fileInput.onchange = () => { handleFiles(fileInput.files); fileInput.value = ""; };
+
+      // 填充部门/分类下拉（选项来自 common.js 的 QA.DEPT_OPTIONS / QA.CATEGORY_OPTIONS）
+      function fillOptions(selectId, options) {
+        const sel = $(selectId);
+        sel.innerHTML = options.map(o =>
+          '<option value="' + QA.esc(o.value) + '">' + QA.esc(o.label) + '</option>').join("");
+      }
+      fillOptions("metaDept", QA.DEPT_OPTIONS);
+      fillOptions("metaCategory", QA.CATEGORY_OPTIONS);
+
+      // 读取 meta
+      function currentMeta() {
+        const meta = {};
+        const dk = $("metaDocKey").value.trim();
+        const dept = $("metaDept").value;
+        const cat = $("metaCategory").value;
+        if (dk) meta.doc_key = dk;
+        if (dept) meta.department = dept;   // "无" 对应空串，不传后端
+        if (cat) meta.category = cat;
+        return Object.keys(meta).length ? meta : null;
+      }
+
+      // 处理多文件：并发上传（先入库），再各自轮询清洗切片进度
+      function handleFiles(fileList) {
+        const files = Array.from(fileList);
+        if (!files.length) return;
+        summaryBar.style.display = "flex";
+        // 并发上传（Promise.all），每个文件独立走「上传→入库→轮询」链路
+        files.forEach((f) => startUpload(f));
+        updateSummary();
+      }
+
+      async function startUpload(file) {
+        const item = createUploadItem(file);
+        // 阶段 1：上传入库（POST /documents，后端返回 202 立即入队，真正清洗切片在后台）
+        try {
+          const resp = await QA.uploadDocument(file, currentMeta());
+          item.status = resp.status;
+          item.docId = resp.doc_id;
+          item.taskId = resp.task_id;
+          item.version = resp.version;
+
+          if (resp.duplicated) {
+            // 幂等命中：内容未变，直接完成
+            markDone(item, "内容未变化（幂等命中）");
+          } else if (resp.status === "pending" && resp.task_id) {
+            // 入库完成，进入后台清洗切片阶段，开始轮询
+            item.note("已入库，后台清洗切片中…");
+            pollTask(item, resp.task_id);
+          } else {
+            markDone(item, "状态 " + resp.status);
+          }
+        } catch (e) {
+          markFailed(item, e.message);
+        }
+      }
+
+      function createUploadItem(file) {
+        const item = {
+          name: file.name, size: file.size, status: "uploading",
+          docId: "", taskId: "", version: 0, timer: null,
+        };
+        const el = document.createElement("div");
+        el.className = "upload-item";
+        el.innerHTML =
+          '<div class="ui-head">' +
+          '<span class="ui-name">' + QA.esc(file.name) + '</span>' +
+          '<span class="ui-size">' + QA.fmtBytes(file.size) + '</span>' +
+          '<span class="ui-actions"><span class="badge info" data-role="status">上传中</span>' +
+          '<button class="btn sm ghost" data-role="remove">移除</button></span>' +
+          '</div>' +
+          '<div class="progress-track"><div class="progress-fill" data-role="bar" style="width:0%"></div></div>' +
+          '<div class="phase-tags">' + PHASES.map(p =>
+            '<span class="phase-tag" data-phase="' + p.key + '">' + p.label + '</span>').join("") +
+          '</div>' +
+          '<div class="warnings" data-role="warnings"></div>' +
+          '<div class="meta-bar" data-role="note" style="margin-top:8px;"></div>';
+        el.querySelector('[data-role="remove"]').onclick = () => {
+          if (item.timer) clearInterval(item.timer);
+          el.remove();
+          updateSummary();
+        };
+        item.el = el;
+        item._statusEl = el.querySelector('[data-role="status"]');
+        item._barEl = el.querySelector('[data-role="bar"]');
+        item._warnEl = el.querySelector('[data-role="warnings"]');
+        item._noteEl = el.querySelector('[data-role="note"]');
+        grid.prepend(el);
+        return item;
+      }
+
+      // 轮询任务进度
+      function pollTask(item, taskId) {
+        let first = true;
+        item.timer = setInterval(async () => {
+          try {
+            const t = await QA.getTask(taskId);
+            renderProgress(item, t);
+            if (t.status === "done") {
+              clearInterval(item.timer);
+              markDone(item, "入库完成");
+            } else if (t.status === "failed") {
+              clearInterval(item.timer);
+              markFailed(item, (t.error && t.error.message) || "入库失败");
+            }
+          } catch (e) {
+            // 轮询失败不中断，下次重试；连续失败可提示
+            if (first) { item.note("轮询异常：" + e.message); first = false; }
+          }
+        }, 1200);
+      }
+
+      function renderProgress(item, t) {
+        const p = t.progress || {};
+        const phase = p.phase || "parse";
+        const percent = p.percent || 0;
+        const chunks = p.chunks_done || 0;
+
+        item._statusEl.textContent = "处理中";
+        item._statusEl.className = "badge info";
+        item._barEl.style.width = Math.max(percent, 4) + "%";
+
+        // 阶段高亮
+        item.el.querySelectorAll(".phase-tag").forEach((tag) => {
+          const key = tag.getAttribute("data-phase");
+          const order = PHASES.findIndex((x) => x.key === key);
+          const curOrder = PHASES.findIndex((x) => x.key === phase);
+          tag.className = "phase-tag " + (order < curOrder ? "done" : order === curOrder ? "active" : "");
+        });
+
+        // warnings
+        const warns = t.warnings || [];
+        item._warnEl.innerHTML = warns.map(w =>
+          '<div class="warning">⚠ ' + QA.esc(w.detail || w.type) + '</div>').join("");
+
+        item._noteEl.innerHTML = '<span class="faint">' +
+          '阶段 ' + phase + ' · ' + percent + '%' +
+          (chunks ? ' · ' + chunks + ' 块' : '') + '</span>';
+      }
+
+      function markDone(item, msg) {
+        item._statusEl.textContent = "完成";
+        item._statusEl.className = "badge ok";
+        item._barEl.style.width = "100%";
+        item._barEl.className = "progress-fill done";
+        item.el.querySelectorAll(".phase-tag").forEach((t) => { t.className = "phase-tag done"; });
+        item._noteEl.innerHTML = '<span class="muted">' + QA.esc(msg) + '</span>';
+        if (item.docId) item._noteEl.innerHTML += ' <span class="faint mono">doc_id=' + QA.esc(item.docId) + ' v' + item.version + '</span>';
+        updateSummary();
+      }
+      function markFailed(item, msg) {
+        item._statusEl.textContent = "失败";
+        item._statusEl.className = "badge err";
+        item._barEl.className = "progress-fill failed";
+        item._warnEl.innerHTML += '<div class="warning" style="color:var(--red)">✖ ' + QA.esc(msg) + '</div>';
+        updateSummary();
+      }
+
+      function updateSummary() {
+        const items = Array.from(grid.querySelectorAll(".upload-item"));
+        if (!items.length) { summaryBar.style.display = "none"; return; }
+        const done = items.filter(i => i.querySelector('[data-role="status"]').textContent === "完成").length;
+        const failed = items.filter(i => i.querySelector('[data-role="status"]').textContent === "失败").length;
+        const processing = items.length - done - failed;
+        summaryBar.innerHTML =
+          '<span>共 ' + items.length + ' 个</span>' +
+          '<span style="color:var(--green)">完成 ' + done + '</span>' +
+          '<span style="color:var(--amber)">处理中 ' + processing + '</span>' +
+          '<span style="color:var(--red)">失败 ' + failed + '</span>';
+      }
+
+      // 页面加载时提示上传说明
+      window.QA = window.QA || {};
+    })();
+  </script>
+</body>
+</html>

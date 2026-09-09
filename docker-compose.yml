@@ -1,0 +1,45 @@
+# Enterprise-QA-Agent 编排（M5）：app + Redis（checkpointer 跨会话记忆）
+# 用法：`docker compose up -d --build`
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 从宿主机 .env 透传（docker compose 自动读同目录 .env 用于变量替换）
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-dashscope}
+      QWEN_EMBEDDING_MODEL: ${QWEN_EMBEDDING_MODEL:-text-embedding-v3}
+      EMBED_DIMENSIONS: ${EMBED_DIMENSIONS:-1024}
+      QWEN_LLM_MODEL: ${QWEN_LLM_MODEL:-qwen-plus}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-}
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-tenant_demo}
+      # checkpointer：指向 redis 服务；不可达自动降级内存（不阻塞启动）
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CHECKPOINTER_ENABLED: ${REDIS_CHECKPOINTER_ENABLED:-1}
+      # 观测
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    volumes:
+      - ./data:/app/data          # 向量库/BM25/registry/上传/日志 持久化
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]   # AOF 持久化 checkpoint
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

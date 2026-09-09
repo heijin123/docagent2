@@ -1,0 +1,22 @@
+# 运行时数据（不入库）
+data/chroma_db/
+data/bm25/
+data/registry.db
+data/logs/
+data/reports/
+data/uploads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.workbuddy/
+.env
+
+# uv
+.python-version
+uv.lock
+
+# IDE
+.idea/
+.vscode/
