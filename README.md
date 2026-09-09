@@ -1,0 +1,203 @@
+# Enterprise-QA-Agent — 企业级智能问答 Agent
+
+> RAG + LangGraph 多 Agent 企业问答系统。混合检索（向量 + BM25 + RRF）、引用溯源、SSE 流式问答 API。
+> 当前进度：**M6 完成**（评估体系：golden 集 + recall@5/MRR + 引用可回查率），M1 摄取 / M2 检索 / M3 Agent 编排 / M4 API / M5 观测部署已闭环。
+
+需求与契约：见 [`docs/`](docs/)（requirements v1.2 / api-contract v1.3 / doc-agent 吸收记录）。
+
+## M1 已交付能力
+
+| 能力 | 说明 |
+|---|---|
+| 7→4 格式解析 | PDF（PyMuPDF）/ DOCX / MD / TXT，扩展名主判 + 内容嗅探兜底（含 OLE 旧版拒绝） |
+| 统一 Block | 解析器可插拔，`parse(file) -> list[Block]`（heading/paragraph/table/code/image/figure_transcript） |
+| 定制 chunking | 512 token 上限 + 80 overlap；**table/code 整块不切断**；超长按行/句递归二次切 |
+| PDF 质量门 | 逐页红/黄/绿零成本判级：乱码率 / 纯图页 / 文本过短 |
+| VLM 转录钩子 | 红页 → `figure_transcript`（配 Key + VLM_ENABLED=1）；无 Key 降级原文入库 + 报告明示（R7 不崩） |
+| 幂等入库 | `(tenant, doc_key)` 登记表 + `content_hash` 指纹：同 hash 重传全 skip；异 hash → **版本化软更新**（旧版 is_valid=false） |
+| 双索引写入 | Chroma（向量，Append-Only）+ BM25（rank_bm25 + jieba），写入先向量后 BM25，先插新版再翻旧版（无空窗） |
+| Embedding 双通道 | dashscope text-embedding-v3（分批 10 + 指数退避）/ 无 Key 自动降级 mock（degraded 标注不掩盖） |
+| chunk 断点续跑 | 写入前 contains() 查重，跳过已完成 chunk（不重复计费） |
+| CLI 报告 | 逐文档表格（状态/格式/v/块数/红黄绿/耗时/降级）+ 幂等跳过日志 |
+
+## M2 已交付能力
+
+| 能力 | 说明 |
+|---|---|
+| 统一过滤谓词 | 单源 `_filters`：`is_valid=true` + tenant 隔离 + permission 分级（public≤internal≤secret）+ 现行性窗口 + 可配 category/department；向量（Chroma where）与 BM25（SQL）从同一谓词生成，**防双路规则漂移**（F2.7） |
+| 并行召回 | `HybridRetriever.retrieve()` 同步（M3 图节点用）/ `aretrieve()` 异步双路 gather 并行（F2.3/F6.4）；单路失败 → degraded 标注 + 存活路结果，不阻断 |
+| RRF 融合 | score = Σ 1/(60+rank)，输出 top_n=8；命中带 `sources`（vector/bm25）、双路 rank、融合分 |
+| 结果溯源完整 | 命中携带 chunk_id / doc_title / page_num / version / permission / effective_time / doc_year 等全 metadata（citation 直接可用） |
+| 时效两级（F2.8） | 现行不足由上层判定后调 `relaxed_retrieve()` 顺序发起二级候选（**仅**放宽 effective_time）；过期命中标 `validity=expired` + `expired_at`，走"需用户确认"分支；列表为空时自动兜底同语义 |
+| 年份感知（F2.9） | 显式年份 → `doc_year` 过滤检索；与语义 top1 同 doc_id 才采用，否则**回退语义结果 + note 明示**（doc-agent 实证坑已内置） |
+| BM25 元数据对齐 | bm25_corpus 增列（tenant/permission/category/department/effective_time/doc_year + meta_json），`ALTER` 幂等迁移兼容 M1 存量库 |
+| 验证 | `verify_m2.py`：30 断言（过滤/权限/隔离/过期/年份双分支/单路降级/async 一致性） |
+
+## M3 已交付能力
+
+| 能力 | 说明 |
+|---|---|
+| LangGraph 六节点图 | `ingest → supervisor → (rewrite → retrieve → answer → verify)⁎ → finalize` + direct_reply/handoff/retry（契约 §4.1 节点清单） |
+| 意图路由（F3.1） | supervisor pydantic + Literal 枚举（kb_qa/chitchat/human_handoff），temp=0 |
+| 查询改写（F3.2） | 结合对话历史消歧，无历史透传；过期确认的自然语言放行（"是/查看"→ include_expired） |
+| 检索节点（F3.3） | 挂 F2 HybridRetriever；仅命中过期 → 发确认话术（无 interrupt，F2.8） |
+| Answer（F3.4/F3.9） | 强制 `[来源: 文档 页码]` 引用格式 + 引用只允许来自证据（防编造）；资料不足直说；过期引用失效提示规则进 prompt |
+| Verify（F3.5/F3.9） | 独立校验（输入只含引用内容+答案，不给思维链）；含过期引用 → confidence ≤0.5；纯过期支撑 → degraded=true |
+| 防死循环（F3.6/F3.8） | 置信度/重试判定全在条件边：verify 不达标且 retry<2 → rewrite 回环；超限 → handoff |
+| Handoff（F3.7） | 兜底话术 + degraded=true（supervisor 直达或 verify 兜底共用） |
+| 对话记忆（F4） | checkpointer 持久化（thread_id=`{tenant}:{user}`）；窗口截断最近 10 轮=20 条消息；每轮入口重置本轮输出字段防跨轮串扰 |
+| 双通道降级 | LLM：DashScope(qwen-plus, JSON 模式) / 无 Key→Stub 规则式（保链路回归）；checkpointer：RedisSaver / 不可达→InMemorySaver（降级不掩盖） |
+| 验证 | `verify_m3.py`：25 断言（三类意图路由 / 引用达标链 / 重试 2 次转人工 / 过期两轮流 / 记忆与窗口） |
+
+## M4 已交付能力
+
+| 能力 | 说明 |
+|---|---|
+| FastAPI 服务 | `app/api/main.py`（create_app）：CORS + X-Request-Id 中间件 + 统一错误体 + 可选鉴权（配置 SERVICE_API_KEY 后启用） |
+| SSE 流式问答 | `POST /api/v1/chat`（F5.1）：事件序 ready → token* → citation* → done / error，空闲 >15s ping 保活；**token 事件即 LLM 真实增量**（answer 节点文本流式 + 引用反解）；非 LLM 直答（handoff/chitchat/确认话术）done 前整段补发 token，前端拼接零特判 |
+| 非流式回复 | `stream=false` 返回单个 AssistantReply（含 request_id/latency_ms），经并发闸（默认 50）超限 429 |
+| 文档异步入库 | `POST /api/v1/documents`（F5.2/F6.5）：三态 202（新/变更/删后重传）/ 200 duplicated / 409 INGEST_IN_PROGRESS；单写者线程池串行入库（Chroma 并发写限制）+ 阶段进度回写（parse/chunk/embed/index） |
+| 任务状态 | `GET /api/v1/tasks/{id}`（F5.3）：progress.phase/percent、warnings（红页/质量告警）、error{code,message} |
+| 软删除 | `DELETE /api/v1/documents/{doc_id}`（F5.7）：翻 is_valid=false + registry is_deleted 标记，重复删除幂等 204；删后重传 → 版本化重入 |
+| 对话历史 | `GET /api/v1/threads/{thread_id}/history?limit=`（F5.4） |
+| 检索调试 | `POST /api/v1/debug/retrieve`（F5.8）：双路 rank/score + RRF fused 明细 + filters/degraded/notes |
+| 健康检查 | `GET /api/v1/health`（F5.5）：vector/bm25 核心 down → 503；仅 Redis 降级 → 200 degraded（设计内降级，见契约 v1.3） |
+| 流式引用 | 文本流结束后从 `[来源: 标题 页码]` 反解 chunk_id（`_parse_chunk_ids_from_answer`）；反解失败 verify grounded=False → 重试/handoff 自然兜底，不编造引用 |
+| 验证 | `verify_m4.py`：35 断言（SSE 事件序/校验错误路径/上传三态轮询/删除幂等/debug 结构/隔离） |
+
+## M5 已交付能力
+
+| 能力 | 说明 |
+|---|---|
+| 结构化观测 | `app/core/observability.py`：零第三方依赖计时 + 慢操作 JSON 行日志（`slow_query`/`llm_call`/`ingest_slow`/`http_request`），`req_id` 贯穿；`LOG_FORMAT=json`（默认）输出单行 JSON 供 Loki/ELK 采集 |
+| 耗时埋点 | middleware（每请求耗时+状态码）/ hybrid 检索（慢查询，含 hits/used_roads）/ LLM 往返（node/model/tokens）/ 入库（doc_id/chunks/status）；阈值 `OBS_SLOW_*_MS` 可调 |
+| 压测脚本 | `scripts/loadtest.py`：纯标准库（urllib + ThreadPoolExecutor），并发 SSE 问答 + 文档入库两模式，输出吞吐/延迟分位 p50/p90/p99/错误率/SSE 事件分布 |
+| 容器化部署 | `Dockerfile`（多阶段 + 非 root + 健康检查）+ `docker-compose.yml`（app + Redis AOF）+ `docs/deployment.md`（鉴权/扩容/容量规划/观测/压测基线/优化方向） |
+| 验证 | `verify_m5.py`：29 断言（观测模块/JSON 日志/埋点生效/压测 CLI/部署三件套） |
+
+## M6 已交付能力
+
+| 能力 | 说明 |
+|---|---|
+| golden 评估集 | `data/golden/qa_golden.json`：13 条起步（语义类/精确编号类/跨年份三类），每条 `query → 期望文档 + 锚句`；锚句归一化（全半角/空白/大小写）子串匹配全库定位期望块，**零人工标注块 id** |
+| 检索层指标 | `app/eval/metrics.py`：recall@5（期望块进 top-k 的用例占比）+ MRR；锚句定位失败用例不计分母（F7.2） |
+| 答案层指标 | 引用可回查率——`citations.chunk_id` 必须属于检索命中块（F7.3，`--answers` 开启，需真 Key） |
+| 门槛判定 | 真实向量 recall@5 ≥ 0.8 → pass；mock 向量无语义 → 指标 SKIP 并标 degraded（F7.4） |
+| 报告 + CLI | `data/reports/eval_report_latest.json`（provider/degraded/逐用例明细）；`python -m app.cli eval [--answers] [--top-k K]` |
+| 实测 | 真实 DashScope：**recall@5=1.000 / MRR=1.000 / 13/13**（verdict=pass，远超门槛） |
+| 验证 | `verify_m6.py`：18 断言（golden 校验/normalize/锚句定位/mock SKIP/报告落盘/CLI） |
+
+## M7 已交付能力（Web 前端）
+
+| 能力 | 说明 |
+|---|---|
+| 提问页 | `web/index.html`：SSE 流式问答（token 增量渲染 + 引用卡片 + 意图/置信度/耗时徽章）+ 对话历史侧栏 + 服务健康状态 + 新会话/流式开关/过期资料开关 |
+| 文档管理页 | `web/upload.html`：多文件拖拽/选择**并发上传**，上传即 202 入队（先入库），后台清洗切片（parse→chunk→embed→index 四阶段进度条 + warnings + 失败重试），任务实时轮询 |
+| 静态挂载 | FastAPI `StaticFiles` 挂载 `web/`，根路径 `/` 重定向到提问页；零构建零依赖（纯 HTML/CSS/JS，直接浏览器访问 `http://127.0.0.1:8000/`） |
+| 验证 | 端到端实测：SSE 事件序 ready→token*→citation→done、上传三态（202/200/409）、任务轮询 done、软删除 204 全通过 |
+
+## 快速开始
+
+```bash
+uv sync --dev                 # 清华镜像，Python ≥3.13（.python-version 锁定 3.13）
+.venv/Scripts/python.exe scripts/make_samples.py   # 生成演示语料
+.venv/Scripts/python.exe -m app.cli ingest data/samples   # 摄取（无 Key 自动 mock）
+.venv/Scripts/python.exe scripts/verify_m1.py       # M1 验证：41 断言
+.venv/Scripts/python.exe scripts/verify_m2.py       # M2 验证：30 断言
+.venv/Scripts/python.exe scripts/verify_m3.py       # M3 验证：25 断言（stub LLM + 内存检查点）
+.venv/Scripts/python.exe scripts/verify_m4.py       # M4 验证：35 断言（TestClient + 隔离服务）
+.venv/Scripts/python.exe -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000   # 启动 API + Web 前端
+# 浏览器打开 http://127.0.0.1:8000/ （提问页），/upload.html 为文档管理页
+```
+
+配真 Key / Redis（可选）：
+- 项目根建 `.env`：`DASHSCOPE_API_KEY=sk-xxx`（对话 LLM + embedding 自动切真模型）
+- Redis（跨会话记忆）：`REDIS_URL=redis://localhost:6379/0`（本机或 WSL2 内起 redis-server 即可；不可达自动降级内存并明示）
+- **真实环境冒烟清单**（stub/mock 只保链路）：① 真 Key 下跑一轮 kb_qa 看真实检索→引用→verify；② Redis 起来后同一 thread 两轮对话，重开进程历史仍在；③ 过期文档确认流（验收标准 8）。
+
+API 一览（契约 `docs/api-contract.md`，OpenAPI：`docs/openapi.yaml`）：
+
+```bash
+# SSE 流式问答
+curl -N -X POST http://127.0.0.1:8000/api/v1/chat \
+  -H 'Content-Type: application/json' -H 'X-Tenant-Id: tenant_demo' \
+  -d '{"thread_id":"tenant_demo:user_demo","question":"报销单编号规则 XB 开头几位？"}'
+# 文档上传 → 202 task_id，轮询 /api/v1/tasks/{id} 至 done
+curl -X POST http://127.0.0.1:8000/api/v1/documents \
+  -H 'X-Tenant-Id: tenant_demo' -F file=@data/samples/sample_guide.md
+# 检索调试
+curl -X POST http://127.0.0.1:8000/api/v1/debug/retrieve \
+  -H 'Content-Type: application/json' -d '{"query":"年假 跨年 审批"}'
+```
+
+## 目录结构
+
+```
+app/
+├── core/            # config（环境变量+.env）/ 结构化日志
+├── models/          # 数据契约：Block / DocMeta / ChunkRecord / Citation / doc_id 派生
+├── ingestion/
+│   ├── detection.py # 格式探测
+│   ├── parsers.py   # 可插拔解析器（pdf/docx/md/txt）
+│   ├── pdf_quality.py # 质量门红黄绿判级（F1.9）
+│   ├── chunking.py  # 分格式定制切片 + 二次切分
+│   ├── registry.py  # DocRegistry 幂等登记（sqlite）
+│   ├── vlm.py       # VLM 转录器抽象（dashscope / none 降级）
+│   └── pipeline.py  # 摄取编排：detect→parse→chunk→embed→双索引
+├── retrieval/
+│   ├── embedding.py # dashscope/mock 双通道
+│   ├── vectorstore.py # Chroma（Append-Only + soft-delete）
+│   ├── bm25store.py # rank_bm25 + jieba（扩展元数据列 + 过滤式检索）
+│   └── hybrid.py    # HybridRetriever：并行召回 + RRF + F2.8/F2.9
+├── agent/
+│   ├── state.py     # AgentState（契约 §4.1）
+│   ├── schemas.py   # 节点结构化输出（intent Literal / verify）
+│   ├── prompts.py   # prompt 构建（JSON 示例一律 json.dumps；M4 加 answer_stream_prompt 纯文本模板）
+│   ├── llm.py       # DashScope / Stub 双通道（M4 加 stream_answer 流式）
+│   ├── nodes.py     # ingest/supervisor/rewrite/retrieve/answer/verify/retry/handoff/finalize（answer 支持 token_sink）
+│   ├── checkpointer.py # RedisSaver → InMemorySaver 降级工厂
+│   └── graph.py     # StateGraph 组装 + AgentApp（reply/history/stream_events）
+├── api/             # M4 FastAPI 服务层
+│   ├── main.py      # create_app：lifespan / 中间件 / 错误处理 / 路由挂载
+│   ├── deps.py      # Services 全局单例（共享 store/retriever/agent/task_manager）
+│   ├── middleware.py # X-Request-Id + 可选鉴权（SERVICE_API_KEY）+ tenant
+│   ├── errors.py    # ApiError + 统一错误体（契约 §1.5）
+│   ├── ingest_tasks.py # 入库后台任务（单写者 + 进度 + in-flight 409）
+│   └── routes/      # chat(SSE)/documents/tasks/threads/debug/health
+├── models/          # 数据契约：Block / DocMeta / ChunkRecord / Citation / api.py（请求/响应模型）
+├── eval/            # M6 评估体系
+│   ├── golden.py    # golden 加载/校验 + 锚句归一化子串定位期望块
+│   ├── metrics.py   # recall@5 / MRR / 引用可回查率
+│   └── runner.py    # 编排 + 门槛判定 + 报告落盘
+└── cli.py           # python -m app.cli ingest / eval
+web/                       # M7 前端（零构建纯静态，FastAPI StaticFiles 挂载）
+├── index.html             # 提问页（SSE 流式 + 引用 + 历史 + 健康）
+├── upload.html            # 文档管理页（并发上传 + 清洗切片进度轮询）
+├── common.css             # 共享暗色样式
+└── common.js              # 共享 API 客户端 + SSE 解析
+scripts/make_samples.py  # 演示语料生成
+scripts/verify_m1.py     # M1 验证断言
+scripts/verify_m2.py     # M2 检索验证断言
+scripts/verify_m3.py     # M3 图编排验证断言
+scripts/verify_m4.py     # M4 API 端到端验证断言
+scripts/verify_m5.py     # M5 观测/部署验证断言
+scripts/verify_m6.py     # M6 评估验证断言
+scripts/loadtest.py      # M5 压测脚本
+data/samples/            # 演示语料（md/txt/docx/pdf/含红页 pdf）
+data/golden/qa_golden.json  # 评估 golden 集（13 条起步）
+data/chroma_db|bm25|registry.db|uploads  # 运行时数据（gitignore）
+```
+
+## Roadmap
+
+| 里程碑 | 内容 | 状态 |
+|---|---|---|
+| M1 | 解析 + chunking + 质量门 + 双索引 + 幂等版本化 | ✅ 41/41 |
+| M2 | 混合检索：向量 + BM25 并行 + RRF + 年份/时效过滤 | ✅ 30/30 |
+| M3 | LangGraph 多 Agent：supervisor/rewrite/retrieve/answer/verify/handoff + Redis checkpointer | ✅ 25/25（stub） |
+| M4 | FastAPI：SSE 流式 + 文档上传 + 软删除 + debug/health | ✅ 35/35 |
+| M5 | 观测（JSON 日志+耗时埋点+慢操作）+ 压测脚本 + Docker/部署手册 | ✅ 29/29 |
+| M6 | 评估体系：golden recall@5/MRR + 引用可回查率 | ✅ 18/18 |
+| M7 | Web 前端：提问页（SSE 流式）+ 文档管理页（并发上传+进度） | ✅ 端到端实测 |
+
+> 已知工程坑（实现期实测）：Chroma `query_texts` 会触发默认模型下载 → 检索统一走显式 embedding；jieba 在 Py3.14 无 wheel 需锁 3.13（`.python-version`）；PyMuPDF 默认字体不含中文，生成语料需 `insert_font(fontfile=simhei.ttf)`；`VectorStore.query` 的 `top_k/where` 是 keyword-only，`asyncio.to_thread` 传参须用 lambda；BM25 SQL 占位符数必须与参数数动态匹配（permission 白名单长度可变）；**langgraph 需 ≥1.2.11**（0.5.0 与 langchain-core 1.6 冲突报 MRO 错误），checkpoint-redis 镜像源最高 0.5.2；pydantic v2 静默忽略 extra 字段——构造 ChunkRecord 时元数据键名必须精确（`effective_time` 写成 `eff` 会被丢弃且不报错）；checkpoint 跨轮持久化 → 每轮入口必须重置"本轮输出"字段（degraded/intent/citations 等），否则上一轮 handoff 状态串扰下一轮；**Py3.12+ `StopIteration` 不能经 `asyncio.to_thread` 的 Future 传播**（转 RuntimeError）→ SSE 迭代器用哨兵对象收尾；FastAPI 路由 prefix 若自带 `/v1` 再 include `prefix=/api/v1` 会双前缀 → 各 router 去掉版本段统一由 include 加；新版 FastAPI include_router 为 `_IncludedRouter` 惰性挂载（openapi 才可查完整路径）；**Windows 下 Chroma 的 sqlite 句柄延迟释放** → 测试用 `TemporaryDirectory` 清理会 `PermissionError [WinError 32]`，须 `mkdtemp + shutil.rmtree(ignore_errors=True)` 并在 `close()` 后手工清理。
