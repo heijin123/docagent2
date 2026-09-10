@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | v1.2 |
+| 文档版本 | v1.3 |
 | 创建日期 | 2026-09-08 |
-| 更新记录 | v1.2（2026-09-09）：吸收 doc-agent 项目已验证的工程实践——新增 F1.9 PDF 质量门与 VLM 转录、F1.10 图片引用链路、F2.9 年份感知召回、F7 评估体系；7.1 元数据扩展（doc_date/doc_year/image_ids）；风险清单与验收标准同步扩充（详见 `docs/doc-agent-absorption.md`） |
+| 更新记录 | v1.3（2026-09-10）：同步契约 v1.3 与实现——① §1.3 非目标改为「不做独立前端工程，但附带零构建静态调试客户端 web/（M7）」；② §5 性能 NFR 标注真实基线 16.8s 与优化路径；③ §6.1 SSE 示例 citation 补 doc_date/image_ids；④ 开发计划 §9、验收 §10 补 M7。<br>v1.2（2026-09-09）：吸收 doc-agent 项目已验证的工程实践——新增 F1.9 PDF 质量门与 VLM 转录、F1.10 图片引用链路、F2.9 年份感知召回、F7 评估体系；7.1 元数据扩展（doc_date/doc_year/image_ids）；风险清单与验收标准同步扩充（详见 `docs/doc-agent-absorption.md`） |
 | 项目代号 | Enterprise-QA-Agent |
 | 技术关键词 | RAG / 向量数据库 / BM25 混合索引 / LangGraph 多 Agent / FastAPI / 异步并发 |
 
@@ -26,7 +26,7 @@
 ### 1.3 非目标（Out of Scope）
 
 - 不做用户权限体系（RBAC）的完整实现，仅预留 tenant_id 字段做数据隔离。
-- 不做前端页面，仅提供 API（可用 Swagger UI / curl 验证）。
+- 不做独立前端工程；但附带一个零构建纯静态调试客户端（`web/`，M7），仅用于本地联调与演示，不计入产品前端。
 - 不追求微调模型，全部基于通用 LLM + 检索增强。
 
 ---
@@ -474,7 +474,7 @@ stateDiagram-v2
 
 | 类别 | 指标 |
 |---|---|
-| 性能 | 单问全链路 P95 ≤ 8s；流式首 token P95 ≤ 2s（检索+改写阶段） |
+| 性能 | 单问全链路 P95 ≤ 8s（**目标值**；当前真实 DashScope 基线约 16.8s，需落地并行 verify / 仅歧义时触发 rewrite 等优化方可达成，见 deployment §7）；流式首 token P95 ≤ 2s（检索+改写阶段） |
 | 并发 | 单实例支撑 50 并发问答请求，无明显错误率上升（压测验证） |
 | 可用性 | 单路检索故障可降级；LLM 调用失败重试后仍失败返回结构化错误 |
 | 可观测性 | 结构化日志（请求级 request_id 贯穿 API→Agent→检索）；记录每次检索的召回数、融合耗时、LLM token 用量 |
@@ -507,10 +507,10 @@ event: token
 data: {"content": "根据《考勤管理制度》"}
 
 event: citation
-data: {"doc_title": "考勤管理制度.pdf", "page_num": 12, "chunk_id": "doc_a1_0001_0012", "validity": "valid"}
+data: {"doc_title": "考勤管理制度.pdf", "page_num": 12, "chunk_id": "doc_a1_0001_0012", "validity": "valid", "doc_date": "2025-01-01", "image_ids": []}
 
 event: citation
-data: {"doc_title": "福利制度_2024版.pdf", "page_num": 3, "chunk_id": "doc_b2_0001_0003", "validity": "expired", "expired_at": 1751241600}
+data: {"doc_title": "福利制度_2024版.pdf", "page_num": 3, "chunk_id": "doc_b2_0001_0003", "validity": "expired", "expired_at": 1751241600, "doc_date": "2024-01-01", "image_ids": []}
 
 event: done
 data: {"confidence": 0.86, "degraded": false, "latency_ms": 3200}
@@ -686,6 +686,7 @@ class VerifyResult(BaseModel):
 | M4 | FastAPI：SSE 流式、文档上传异步任务、限流、异常处理 | 可用 API 服务 | 2 天 |
 | M5 | 压测 + 观测 + 文档 + README | 压测报告、部署说明 | 1~2 天 |
 | M6 | 评估体系（F7）：golden 集 + recall@5/MRR + 引用可回查率 + 门槛判定 | eval CLI + 报告落盘 | 1 天 |
+| M7 | Web 前端（零构建静态调试客户端）：提问页（SSE 流式）+ 文档管理页（并发上传 + 四阶段进度轮询） | web/ 静态资源 + FastAPI 挂载 | 1~2 天 |
 
 ---
 
@@ -702,6 +703,7 @@ class VerifyResult(BaseModel):
 9. 质量门（F1.9）：含乱码页/纯图页的 PDF，红页不产乱码块；VLM 转录块（`figure_transcript`）可被语义检索命中；无 Key 时降级原文入库不崩（报告标注）。
 10. 评估（F7，真实向量）：golden recall@5 ≥ 0.8，答案层引用可回查率 100%，报告落盘；mock 模式指标 SKIP 且标注 degraded。
 11. 年份感知（F2.9）："XX 2024 年报"类显式年份问题走两段式裁决；过滤命中跑题主题时回退语义检索并明示（日志/报告可证）。
+12. Web 前端（M7）：提问页 SSE 事件序 ready→token*→citation→done 正常渲染；文档管理页多文件并发上传返回 202 入队、四阶段进度可轮询至 done；软删除后前端列表同步（端到端实测通过）。
 
 ---
 

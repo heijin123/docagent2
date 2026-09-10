@@ -28,8 +28,8 @@
 
 | Header | 必填 | 说明 |
 |---|---|---|
-| `Authorization: Bearer <service_key>` | 是 | 服务密钥；缺失→401，无效→401 |
-| `X-Tenant-Id` | 是 | 租户标识。服务端据此注入 `permission` 过滤条件 |
+| `Authorization: Bearer <service_key>` | 条件必填 | 服务密钥。**仅当服务端配置 `SERVICE_API_KEY` 非空时强制**；未配置则鉴权关闭、放行（默认租户兜底），缺失/无效→401（仅鉴权启用时生效） |
+| `X-Tenant-Id` | 推荐必填 | 租户标识。服务端据此注入 `permission` 过滤条件；缺省时回落 `DEFAULT_TENANT_ID`（默认 `tenant_demo`），多租户场景必须显式传 |
 | `X-Request-Id` | 否 | 客户端透传的追踪 ID（uuid），服务端回显；缺省由服务端生成 |
 
 - **客户端不可直接传 `permission` / `department` 等过滤字段用于提权**——检索过滤条件全部由服务端依据租户-用户权限注入
@@ -232,7 +232,7 @@ SSE 通道内发生错误时 **HTTP 状态保持 200**，通过 `error` 事件�
 }
 ```
 
-任一下游不可用 → HTTP 503，`status: "degraded"`，`checks` 中对应项为 `"down"`。
+核心依赖（vector_store / bm25 / llm）不可用 → HTTP 503，`status: "degraded"`，`checks` 中对应项为 `"down"`（Redis checkpointer 不可达属设计内降级，见下方 v1.3 注）。
 
 > v1.3 语义放宽（实现期实测）：Redis checkpointer 不可达时系统按设计降级内存继续服务（§4.7 降级哲学）——此时 `checks.redis="down"` 但 **HTTP 保持 200**，`status="degraded"`；仅核心依赖（vector_store / bm25 / llm）不可用才返回 503。本地无 Redis 的开发环境因此可正常调用 /health。
 
@@ -409,6 +409,7 @@ class AgentResult(BaseModel):           # = done 事件 data（2.1 AssistantRepl
     answer: str; citations: list[Citation]
     confidence: float; degraded: bool
     intent: str; latency_ms: int; request_id: str
+    notes: list[str] | None = None      # 可选过程说明（年份回退/降级/过期提示等，v1.3 补入）
 ```
 
 - 分支逻辑（重试计数、置信度阈值、仅过期命中提示）在**条件边**实现，LLM 只产出结构化结果（supervisor intent / verify 判定），不决定流程走向
@@ -440,7 +441,7 @@ class AgentResult(BaseModel):           # = done 事件 data（2.1 AssistantRepl
 ### 6.1 唯一权威与代码同步
 
 - `app/models/*` 的 pydantic 模型字段、默认值、枚举与本文档逐条对应；新增/修改模型必须**同步更新本文档并递增版本**
-- M4 交付时生成 `openapi.yaml` 作为机器可读副本，但人工评审以本文档为准；契约测试用 openapi schema 校验实际响应（pytest + fastapi TestClient）
+- M4 交付时生成 `openapi.yaml` 作为机器可读副本（覆盖路径、请求体、错误码结构）；**人工评审以本文档为准，响应体字段以本文档第 2 节为准**；契约测试据此校验实际响应（pytest + fastapi TestClient）
 - 评审清单（Code Review 必查）：
   1. 新字段是否 snake_case + 可选字段带默认值
   2. 枚举是否走第 5 节追加规则

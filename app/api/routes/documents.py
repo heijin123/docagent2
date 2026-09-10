@@ -82,6 +82,12 @@ async def upload_document(
     raw = await file.read()
     if not raw:
         raise ApiError("VALIDATION_INVALID_ARGUMENT", "上传文件为空", 422)
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    if len(raw) > max_bytes:
+        mb = len(raw) / (1024 * 1024)
+        raise ApiError("DOC_TOO_LARGE",
+                       f"文件大小 {mb:.1f}MB 超过上限 {settings.max_upload_mb}MB", 413,
+                       {"max_upload_mb": settings.max_upload_mb})
     content_hash = hashlib.sha256(raw).hexdigest()
 
     parsed_meta = DocumentMeta()

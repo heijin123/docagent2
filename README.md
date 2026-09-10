@@ -1,7 +1,7 @@
 # Enterprise-QA-Agent — 企业级智能问答 Agent
 
 > RAG + LangGraph 多 Agent 企业问答系统。混合检索（向量 + BM25 + RRF）、引用溯源、SSE 流式问答 API。
-> 当前进度：**M6 完成**（评估体系：golden 集 + recall@5/MRR + 引用可回查率），M1 摄取 / M2 检索 / M3 Agent 编排 / M4 API / M5 观测部署已闭环。
+> 当前进度：**M1–M7 全部完成**。M1 摄取 / M2 检索 / M3 Agent 编排 / M4 API / M5 观测部署 / M6 评估体系（golden + recall@5/MRR + 引用可回查率）/ M7 Web 前端（零构建静态调试客户端）均已闭环。
 
 需求与契约：见 [`docs/`](docs/)（requirements v1.2 / api-contract v1.3 / doc-agent 吸收记录）。
 
@@ -200,4 +200,4 @@ data/chroma_db|bm25|registry.db|uploads  # 运行时数据（gitignore）
 | M6 | 评估体系：golden recall@5/MRR + 引用可回查率 | ✅ 18/18 |
 | M7 | Web 前端：提问页（SSE 流式）+ 文档管理页（并发上传+进度） | ✅ 端到端实测 |
 
-> 已知工程坑（实现期实测）：Chroma `query_texts` 会触发默认模型下载 → 检索统一走显式 embedding；jieba 在 Py3.14 无 wheel 需锁 3.13（`.python-version`）；PyMuPDF 默认字体不含中文，生成语料需 `insert_font(fontfile=simhei.ttf)`；`VectorStore.query` 的 `top_k/where` 是 keyword-only，`asyncio.to_thread` 传参须用 lambda；BM25 SQL 占位符数必须与参数数动态匹配（permission 白名单长度可变）；**langgraph 需 ≥1.2.11**（0.5.0 与 langchain-core 1.6 冲突报 MRO 错误），checkpoint-redis 镜像源最高 0.5.2；pydantic v2 静默忽略 extra 字段——构造 ChunkRecord 时元数据键名必须精确（`effective_time` 写成 `eff` 会被丢弃且不报错）；checkpoint 跨轮持久化 → 每轮入口必须重置"本轮输出"字段（degraded/intent/citations 等），否则上一轮 handoff 状态串扰下一轮；**Py3.12+ `StopIteration` 不能经 `asyncio.to_thread` 的 Future 传播**（转 RuntimeError）→ SSE 迭代器用哨兵对象收尾；FastAPI 路由 prefix 若自带 `/v1` 再 include `prefix=/api/v1` 会双前缀 → 各 router 去掉版本段统一由 include 加；新版 FastAPI include_router 为 `_IncludedRouter` 惰性挂载（openapi 才可查完整路径）；**Windows 下 Chroma 的 sqlite 句柄延迟释放** → 测试用 `TemporaryDirectory` 清理会 `PermissionError [WinError 32]`，须 `mkdtemp + shutil.rmtree(ignore_errors=True)` 并在 `close()` 后手工清理。
+> 已知工程坑（实现期实测）：Chroma `query_texts` 会触发默认模型下载 → 检索统一走显式 embedding；jieba 在 Py3.14 无 wheel 需锁 3.13（`.python-version`）；PyMuPDF 默认字体不含中文，生成语料需 `insert_font(fontfile=simhei.ttf)`；`VectorStore.query` 的 `top_k/where` 是 keyword-only，`asyncio.to_thread` 传参须用 lambda；BM25 SQL 占位符数必须与参数数动态匹配（permission 白名单长度可变）；**langgraph 须 ≥1.2.11**（旧版 langgraph 0.5.0 与 langchain-core 1.6 冲突报 MRO 错误，故须升到 1.2.11+）；langgraph-checkpoint-redis 取 0.5.x（0.5.2 验证可用）；pydantic v2 静默忽略 extra 字段——构造 ChunkRecord 时元数据键名必须精确（`effective_time` 写成 `eff` 会被丢弃且不报错）；checkpoint 跨轮持久化 → 每轮入口必须重置"本轮输出"字段（degraded/intent/citations 等），否则上一轮 handoff 状态串扰下一轮；**Py3.12+ `StopIteration` 不能经 `asyncio.to_thread` 的 Future 传播**（转 RuntimeError）→ SSE 迭代器用哨兵对象收尾；FastAPI 路由 prefix 若自带 `/v1` 再 include `prefix=/api/v1` 会双前缀 → 各 router 去掉版本段统一由 include 加；新版 FastAPI include_router 为 `_IncludedRouter` 惰性挂载（openapi 才可查完整路径）；**Windows 下 Chroma 的 sqlite 句柄延迟释放** → 测试用 `TemporaryDirectory` 清理会 `PermissionError [WinError 32]`，须 `mkdtemp + shutil.rmtree(ignore_errors=True)` 并在 `close()` 后手工清理。

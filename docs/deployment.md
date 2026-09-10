@@ -40,6 +40,8 @@ curl http://localhost:8000/api/v1/health
 | `REDIS_CHECKPOINTER_ENABLED` | 1 | 1=用 Redis 跨会话；0=强制内存 |
 | `INGEST_WORKERS` | 1 | 入库线程数；**保持 1**（Chroma 并发写限制） |
 | `API_MAX_INFLIGHT` | 50 | 并发在途问答上限，超限 429 |
+| `MAX_UPLOAD_MB` | 50 | 单文件上传大小上限，超限 413 |
+| `ALLOWED_ORIGINS` | `*` | CORS 白名单（逗号分隔域名）；生产收紧，本地默认 `*` |
 | `LOG_FORMAT` | json | json=生产日志采集；text=本地调试 |
 
 ---
@@ -49,7 +51,7 @@ curl http://localhost:8000/api/v1/health
 1. **生产必须设置 `SERVICE_API_KEY`**（非空即启用 Bearer 鉴权，中间件校验）。
 2. 客户端请求带 `Authorization: Bearer <key>` 与 `X-Tenant-Id`（多租户隔离）。
 3. `X-Tenant-Id` 决定向量/BM25 检索的 tenant 过滤；`thread_id` 前缀须与之一致（`{tenant}:{user}`），否则 422。
-4. CORS 当前 `allow_origins=["*"]` 仅限内网 demo；**生产按域名收紧**（`app/api/main.py`）。
+4. CORS 由 `ALLOWED_ORIGINS`（逗号分隔域名）控制，默认 `*` 仅限内网 demo；**生产按域名收紧**（如 `ALLOWED_ORIGINS=https://a.example.com,https://b.example.com`）。
 5. 上传 `meta.permission` 不接受客户端传入（模型未定义该字段，防提权）；权限默认 `internal`。
 
 ---

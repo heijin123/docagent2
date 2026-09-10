@@ -99,10 +99,19 @@ class Settings:
     api_max_inflight: int = field(default_factory=lambda: _env_int("API_MAX_INFLIGHT", 50))
     sse_ping_interval_s: int = field(default_factory=lambda: _env_int("SSE_PING_INTERVAL_S", 15))
     ingest_workers: int = field(default_factory=lambda: _env_int("INGEST_WORKERS", 1))
+    max_upload_mb: int = field(default_factory=lambda: _env_int("MAX_UPLOAD_MB", 50))
+    allowed_origins: str = field(default_factory=lambda: _env("ALLOWED_ORIGINS", "*"))
 
     @property
     def has_api_key(self) -> bool:
         return bool(self.dashscope_api_key.strip())
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        raw = (self.allowed_origins or "*").strip()
+        if raw == "*":
+            return ["*"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.samples_dir, self.chroma_dir, self.bm25_dir,

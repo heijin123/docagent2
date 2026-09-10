@@ -41,7 +41,7 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],          # 本地/内网部署；生产按域名收紧
+        allow_origins=settings.allowed_origins_list,  # 生产用 ALLOWED_ORIGINS 收紧，本地默认 *
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],

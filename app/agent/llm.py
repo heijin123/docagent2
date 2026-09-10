@@ -61,31 +61,32 @@ class DashScopeLLM(LLMClient):
 
     def complete_json(self, system: str, user: str, schema: type[T],
                       *, temperature: float = 0.0, max_tokens: int = 1500) -> T:
-        span = TimedSpan(name="llm_call").attr(model=self.model)
-        try:
-            resp = self._client.chat.completions.create(
-                model=self.model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-            )
-        finally:
-            # 即使抛错也记录耗时（便于定位超时/慢往返）
-            log_llm_call("", span.stop(log_slow=False), node="complete_json",
-                         model=self.model, prompt_chars=len(system) + len(user))
-        raw = resp.choices[0].message.content or ""
-        # 容忍模型偶尔带 markdown 代码围栏
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```", 2)[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        parsed = json.loads(raw)
-        return schema.model_validate(parsed)
+        last_exc: Exception | None = None
+        for attempt in range(2):  # 解析失败重试一次（模型偶发返回非合法 JSON）
+            span = TimedSpan(name="llm_call").attr(model=self.model)
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+            finally:
+                # 即使抛错也记录耗时（便于定位超时/慢往返）
+                log_llm_call("", span.stop(log_slow=False), node="complete_json",
+                             model=self.model, prompt_chars=len(system) + len(user))
+            try:
+                return _parse_json_strict(schema, resp.choices[0].message.content or "")
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning("complete_json 解析失败(第%d次)，重试一次: %s", attempt + 1, exc)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("complete_json 重试后仍无结果")
 
     def stream_answer(self, system: str, user: str,
                       on_token) -> schemas.AnswerOutput:
@@ -259,6 +260,28 @@ def _citations_text(evidence: str, picks: list[str]) -> str:
         title, page = meta.get(cid, ("未知文档", ""))
         out.append(f"[来源: {title} 第 {page} 页]" if page else f"[来源: {title}]")
     return "；".join(out)
+
+
+def _parse_json_strict(schema: type[T], raw: str) -> T:
+    """解析模型 JSON 输出：剥离代码围栏 + 抽取首个 {...} 片段 + pydantic 校验。
+
+    修复模型偶发返回非合法 JSON（带 markdown 围栏 / 前后多余文本）导致的 500；
+    解析失败由调用方决定是否重试。
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        parts = text.split("```", 2)
+        if len(parts) >= 2:
+            text = parts[1]
+            if text.startswith("json"):
+                text = text[4:]
+    text = text.strip()
+    if not text.startswith("{"):
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            text = m.group(0)
+    parsed = json.loads(text)
+    return schema.model_validate(parsed)
 
 
 def build_llm() -> LLMClient:
