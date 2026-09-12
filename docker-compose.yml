@@ -7,7 +7,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # 从宿主机 .env 透传（docker compose 自动读同目录 .env 用于变量替换）
+      # 从宿主机 .env 取值做 ${VAR:-默认} 替换。注意：这不是"全量透传"——
+      # 只有下面登记的变量才会进容器，未登记者容器内一律用应用默认值。
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-dashscope}
       QWEN_EMBEDDING_MODEL: ${QWEN_EMBEDDING_MODEL:-text-embedding-v3}
@@ -15,6 +16,11 @@ services:
       QWEN_LLM_MODEL: ${QWEN_LLM_MODEL:-qwen-plus}
       SERVICE_API_KEY: ${SERVICE_API_KEY:-}
       DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-tenant_demo}
+      # 服务限额（M4）：白名单式注入——新增配置项需在此登记，否则容器内用默认值
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      API_MAX_INFLIGHT: ${API_MAX_INFLIGHT:-50}
+      INGEST_WORKERS: ${INGEST_WORKERS:-1}
       # checkpointer：指向 redis 服务；不可达自动降级内存（不阻塞启动）
       REDIS_URL: redis://redis:6379/0
       REDIS_CHECKPOINTER_ENABLED: ${REDIS_CHECKPOINTER_ENABLED:-1}
@@ -26,7 +32,9 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      # 与 Dockerfile HEALTHCHECK 语义一致：2xx=健康，503=degraded（核心依赖挂）也算存活，
+      # 不能因 5xx 就判死（curl -f 遇 5xx 返回非 0，故单独把 503 捞出来当通过）。
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/health || curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/v1/health | grep -q '503'"]
       interval: 30s
       timeout: 5s
       retries: 3

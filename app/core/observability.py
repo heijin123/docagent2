@@ -35,6 +35,81 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+# ─────────────────────────────────────────────────────────────
+# Token 用量（贯穿整条链路的成本核算单位，M3+）
+# 此前代码从不读取 resp.usage，token 消耗只能去 DashScope 控制台看，
+# 导致「为了准确率忽略价格影响」。这里把 usage 做成一等公民：
+#   每次 LLM 调用 → TokenMeter 累加 → 单轮 reply 前/后差值 = 该问成本
+#   → 结构化 llm_usage 日志（看钱）/ 慢阈值 llm_call 日志（看慢）/ 评估报告（看总账）
+# ─────────────────────────────────────────────────────────────
+@dataclass
+class TokenUsage:
+    """单次/聚合 LLM token 用量。total_tokens 由服务端返回，不自行相加以防误差。"""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+    def __sub__(self, other: "TokenUsage") -> "TokenUsage":
+        """单轮差值（reply 前/后 snapshot 相减 = 该轮成本）。"""
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens - other.prompt_tokens,
+            completion_tokens=self.completion_tokens - other.completion_tokens,
+            total_tokens=self.total_tokens - other.total_tokens,
+        )
+
+    @classmethod
+    def from_openai(cls, usage) -> "TokenUsage":
+        return cls(
+            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            total_tokens=getattr(usage, "total_tokens", 0) or 0,
+        )
+
+    @classmethod
+    def estimate(cls, prompt_chars: int, completion_chars: int = 0) -> "TokenUsage":
+        """无 usage 时的估算（stub/降级/流式尾块缺失）：中英文混合 ~2 字符/token。"""
+        p = prompt_chars // 2
+        c = completion_chars // 2
+        return cls(prompt_tokens=p, completion_tokens=c, total_tokens=p + c)
+
+    def cost(self, input_per_1k: float, output_per_1k: float) -> float:
+        """预估人民币成本（按 1K token 单价）。"""
+        return self.prompt_tokens / 1000 * input_per_1k + \
+               self.completion_tokens / 1000 * output_per_1k
+
+    def to_dict(self) -> dict:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+class TokenMeter:
+    """累计 token 用量：挂在 LLM 实例上，随每次调用累加；reply 前/后差值 = 单轮成本。"""
+
+    def __init__(self) -> None:
+        self._u = TokenUsage()
+
+    def add(self, usage: TokenUsage) -> None:
+        if usage is not None:
+            self._u = self._u + usage
+
+    def snapshot(self) -> TokenUsage:
+        return TokenUsage(**self._u.to_dict())
+
+    def reset(self) -> None:
+        self._u = TokenUsage()
+
+
 @dataclass
 class TimedSpan:
     """手动 span：start() 打点，stop() 返回耗时并（可选）记录慢日志。"""
@@ -82,23 +157,57 @@ def _emit_slow(*, event: str, duration_ms: float, threshold_ms: int, **attrs: An
 
 def log_slow_query(req_id: str, query: str, duration_ms: float,
                    used_roads: list[str] | None = None, hits: int = 0) -> None:
-    """检索慢查询（event=slow_query）。"""
+    """检索慢查询（event=slow_query）：仅 duration_ms ≥ OBS_SLOW_QUERY_MS 时落日志。"""
+    if duration_ms < _SLOW_QUERY_MS:
+        return
     _emit_slow(event="slow_query", duration_ms=duration_ms,
                threshold_ms=_SLOW_QUERY_MS, req_id=req_id,
                query=query[:120], hits=hits, used_roads=used_roads or [])
 
 
 def log_llm_call(req_id: str, duration_ms: float, *, node: str = "",
-                 model: str = "", prompt_chars: int = 0, tokens: int = 0) -> None:
-    """LLM 往返慢（event=llm_call）。"""
+                 model: str = "", prompt_chars: int = 0,
+                 prompt_tokens: int = 0, completion_tokens: int = 0,
+                 total_tokens: int = 0) -> None:
+    """LLM 往返慢（event=llm_call）：仅 duration_ms ≥ OBS_SLOW_LLM_MS 时落日志；偏延迟。"""
+    if duration_ms < _SLOW_LLM_MS:
+        return
     _emit_slow(event="llm_call", duration_ms=duration_ms,
                threshold_ms=_SLOW_LLM_MS, req_id=req_id, node=node,
-               model=model, prompt_chars=prompt_chars, tokens=tokens)
+               model=model, prompt_chars=prompt_chars,
+               prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+               total_tokens=total_tokens)
+
+
+def log_llm_usage(req_id: str, *, node: str = "", model: str = "",
+                  usage: "TokenUsage | None" = None,
+                  est_cost_cny: float = 0.0) -> None:
+    """LLM token 用量（event=llm_usage）：每次调用必记（不受慢阈值限制），供成本聚合。
+
+    与 log_llm_call（慢阈值限流、偏延迟）互补 —— 前者看「钱」，后者看「慢」。
+    生产环境可由 Loki/Filebeat 按 event=llm_usage 聚合出按 node/model 的成本曲线。
+    """
+    if usage is None:
+        return
+    payload = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "level": "INFO",
+        "event": "llm_usage",
+        "node": node,
+        "model": model,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "est_cost_cny": round(est_cost_cny, 6),
+    }
+    logger.info(json.dumps(payload, ensure_ascii=False))
 
 
 def log_ingest(req_id: str, duration_ms: float, *, doc_id: str = "",
                chunks: int = 0, status: str = "") -> None:
-    """入库慢（event=ingest_slow）。"""
+    """入库慢（event=ingest_slow）：仅 duration_ms ≥ OBS_SLOW_INGEST_MS 时落日志。"""
+    if duration_ms < _SLOW_INGEST_MS:
+        return
     _emit_slow(event="ingest_slow", duration_ms=duration_ms,
                threshold_ms=_SLOW_INGEST_MS, req_id=req_id, doc_id=doc_id,
                chunks=chunks, status=status)

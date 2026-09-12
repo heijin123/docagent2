@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from app.core.config import settings
+from app.core.observability import TokenUsage
 from app.eval.golden import load_golden, locate_expected_chunks
 from app.eval.metrics import compute_answer_metrics, compute_retrieval_metrics
 from app.retrieval.hybrid import HybridRetriever
@@ -53,16 +54,22 @@ class EvalRunner:
 
         # ── 答案层（可选）───────────────────────────────────
         ans_metrics: dict | None = None
+        cost_acc: TokenUsage = TokenUsage()  # 整轮评估的 LLM token 总账（价格可见化）
+        ans_calls = 0
         if with_answers and self.agent is not None:
             answer_results: dict[str, dict] = {}
             for case in cases:
                 try:
                     reply = self.agent.reply(
                         case.query, f"{tenant_id or settings.default_tenant_id}:eval:{case.id}")
+                    u = self.agent.last_usage
+                    cost_acc = cost_acc + u
+                    ans_calls += 1
                     answer_results[case.id] = {
                         "citations": [c.chunk_id for c in reply.citations],
                         "intent": reply.intent,
                         "confidence": reply.confidence,
+                        "usage": u.to_dict(),
                     }
                 except Exception as exc:  # noqa: BLE001
                     answer_results[case.id] = {"citations": [], "error": str(exc)}
@@ -75,6 +82,24 @@ class EvalRunner:
             verdict = "skipped"   # 仅链路，不算通过也不算失败
         else:
             verdict = "pass" if (recall or 0.0) >= RECALL_THRESHOLD else "fail"
+
+        # ── 成本总账（价格可见化，与准确率同列）──────────────
+        if ans_metrics is not None and self.agent is not None:
+            model = getattr(getattr(self.agent, "llm", None), "model", None)
+            ip, op = settings.llm_price(model)
+            cost_report = {
+                "llm_model": model,
+                "llm_calls": ans_calls,
+                "queries": len(answer_results),
+                "total_prompt_tokens": cost_acc.prompt_tokens,
+                "total_completion_tokens": cost_acc.completion_tokens,
+                "total_tokens": cost_acc.total_tokens,
+                "est_cost_cny": round(cost_acc.cost(ip, op), 6),
+                "avg_tokens_per_query": round(cost_acc.total_tokens / ans_calls, 1)
+                if ans_calls else 0,
+            }
+        else:
+            cost_report = None
 
         report = {
             "meta": {
@@ -90,6 +115,7 @@ class EvalRunner:
             },
             "retrieval": ret_metrics,
             "answer": ans_metrics,
+            "cost": cost_report,
             "verdict": verdict,
             "threshold": {"recall_at_k": RECALL_THRESHOLD},
         }

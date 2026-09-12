@@ -1,5 +1,6 @@
-"""节点结构化输出 schema（F3.1 supervisor / F3.2 rewrite / F3.4 answer / F3.5 verify）。
+"""节点结构化输出 schema（F3.2 rewrite / F3.4 answer / F3.5 verify）。
 
+意图分类（原 F3.1 supervisor）已合并进 AnswerOutput.intent，单一 LLM 调用产出。
 字段与需求逐条对应；枚举值取契约 §5（intent 只允许追加）。
 """
 from __future__ import annotations
@@ -11,13 +12,6 @@ from pydantic import BaseModel, Field
 IntentLiteral = Literal["kb_qa", "chitchat", "human_handoff"]
 
 
-class SupervisorIntent(BaseModel):
-    """supervisor 输出（F3.1）：temp=0 意图分类。"""
-
-    intent: IntentLiteral
-    reason: str = Field(default="", description="一句话判断依据（调试用）")
-
-
 class RewriteOutput(BaseModel):
     """rewrite 输出（F3.2）：把指代/省略改写为可独立检索的 query。"""
 
@@ -27,8 +21,13 @@ class RewriteOutput(BaseModel):
 
 
 class AnswerOutput(BaseModel):
-    """answer 输出（F3.4/F3.9）：生成回答 + 从给定证据中选引用的 chunk_id。"""
+    """answer 输出（F3.4/F3.9）：意图 + 生成回答 + 从给定证据中选引用的 chunk_id。
 
+    intent 由 answer 节点（合并了原 supervisor 的意图分类）一并产出，
+    供条件边路由（chitchat/human_handoff 不再单独走 LLM）。
+    """
+
+    intent: IntentLiteral = Field(default="kb_qa", description="意图：kb_qa/chitchat/human_handoff")
     answer: str
     chunk_ids: list[str] = Field(
         default_factory=list,

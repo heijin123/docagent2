@@ -27,3 +27,4 @@ class AssistantReply(BaseModel):
     request_id: str = ""
     latency_ms: int = 0
     notes: list[str] = Field(default_factory=list)
+    usage: dict = Field(default_factory=dict)   # 该轮链路 token 用量（贯穿成本核算，M3+）

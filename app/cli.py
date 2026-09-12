@@ -92,7 +92,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
     agent = None
     if args.answers:
-        agent = AgentApp(retriever, build_llm(), memory_checkpoint=True)
+        # 走 Redis 持久化（与线上一致）；Redis 不可达时 AgentApp 内部自动降级内存，不影响评估正确性
+        agent = AgentApp(retriever, build_llm(), memory_checkpoint=False)
 
     report, path = run_eval(
         retriever, bm25_store, agent=agent,
@@ -112,6 +113,13 @@ def cmd_eval(args: argparse.Namespace) -> int:
         a = report["answer"]
         print(f"答案层: 引用可回查率 = {a['verifiable_rate']:.3f} "
               f"| 评估 {a['verified']} 条")
+    if report.get("cost"):
+        c = report["cost"]
+        print(f"成本: 模型={c['llm_model']} | LLM 调用={c['llm_calls']} 次 "
+              f"| 总 token={c['total_tokens']} "
+              f"(prompt {c['total_prompt_tokens']} / completion {c['total_completion_tokens']}) "
+              f"| 预估 ¥{c['est_cost_cny']:.4f} "
+              f"| 单问均 {c['avg_tokens_per_query']} token")
     print(f"门槛: recall@5 ≥ {report['threshold']['recall_at_k']} → "
           f"verdict = {report['verdict']}")
     print(f"报告: {path}")
@@ -129,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     ingest_p = sub.add_parser("ingest", help="摄取文件/目录（串行，单文档失败不中断）")
     ingest_p.add_argument("paths", nargs="+", help="文件或目录路径")
     ingest_p.add_argument("--rebuild", action="store_true",
-                          help="先软删除该文档旧版本再重灌（VLM 升级后清孤儿）")
+                          help="强制版本化重灌（同 hash 也 bump 版本 → 新 chunk_id，旧版本随后软删）")
     ingest_p.add_argument("--list-models", action="store_true", help="显示当前 embedding 配置")
     ingest_p.set_defaults(func=cmd_ingest)
 

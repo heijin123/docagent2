@@ -232,9 +232,9 @@ SSE 通道内发生错误时 **HTTP 状态保持 200**，通过 `error` 事件�
 }
 ```
 
-核心依赖（vector_store / bm25 / llm）不可用 → HTTP 503，`status: "degraded"`，`checks` 中对应项为 `"down"`（Redis checkpointer 不可达属设计内降级，见下方 v1.3 注）。
+核心依赖（vector_store / bm25）不可用 → HTTP 503，`status: "degraded"`，`checks` 中对应项为 `"down"`。`llm` 恒为 `"up"`：无 Key 时的 stub 降级仍属"功能可用"，不参与 503 判定。（Redis checkpointer 不可达属设计内降级，见下方 v1.3 注。）
 
-> v1.3 语义放宽（实现期实测）：Redis checkpointer 不可达时系统按设计降级内存继续服务（§4.7 降级哲学）——此时 `checks.redis="down"` 但 **HTTP 保持 200**，`status="degraded"`；仅核心依赖（vector_store / bm25 / llm）不可用才返回 503。本地无 Redis 的开发环境因此可正常调用 /health。
+> v1.3 语义放宽（实现期实测）：Redis checkpointer 不可达时系统按设计降级内存继续服务（§4.7 降级哲学）——此时 `checks.redis="down"` 但 **HTTP 保持 200**，`status="degraded"`；仅核心依赖（vector_store / bm25）不可用才返回 503。本地无 Redis 的开发环境因此可正常调用 /health。
 
 ### 2.8 GET /api/v1/images/{image_id} — 图片资源回填（F1.10）
 
@@ -390,7 +390,7 @@ class DocRegistry(Protocol):
 
 ### 4.9 Agent 编排（LangGraph）
 
-节点清单（固定）：`supervisor → (rewrite → retrieve → answer → verify) | direct_reply | handoff`
+节点清单（固定）：`ingest → (chitchat→direct_reply | human_handoff→handoff | 其余→rewrite→retrieve→answer(合并意图)→verify) → finalize` + retry 回环（supervisor 意图分类已合并进 answer 节点）
 
 ```python
 class QAState(TypedDict):
@@ -412,7 +412,7 @@ class AgentResult(BaseModel):           # = done 事件 data（2.1 AssistantRepl
     notes: list[str] | None = None      # 可选过程说明（年份回退/降级/过期提示等，v1.3 补入）
 ```
 
-- 分支逻辑（重试计数、置信度阈值、仅过期命中提示）在**条件边**实现，LLM 只产出结构化结果（supervisor intent / verify 判定），不决定流程走向
+- 分支逻辑（重试计数、置信度阈值、仅过期命中提示）在**条件边**实现；意图分类已合并进 answer 节点（同一次 LLM 调用产出 intent + answer），verify 只产出 grounded/confidence 判定，LLM 不决定流程走向
 - 过期引用约束（F3.9）：citation.validity=expired 时 answer 内必须内嵌失效提示，Verify confidence 下调一档，纯过期支撑 → degraded=true
 
 ---

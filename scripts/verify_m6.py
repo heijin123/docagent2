@@ -3,7 +3,9 @@
 覆盖：
 1. golden 加载 + 校验（缺字段/重复 id/锚句过短 → 抛 ValueError）
 2. normalize 归一化（全半角/空白/大小写）
-3. 锚句定位：灌入样例语料后，每条 golden 锚句能定位到期望块
+3. 锚句定位：灌入样例语料后，**每条** golden 锚句都能定位到期望块（100% 零容忍，
+   否则用例会被静默剔出分母）；写新用例时可先用 `scripts/verify_golden_anchors.py`
+   快速体检（免 chromadb，且会打印失败锚句的可能落点）
 4. 检索层指标：mock 向量 → 指标 SKIP + degraded 标注（F7.4）
 5. 报告落盘 eval_report_latest.json 结构正确
 6. CLI `python -m app.cli eval` 子命令存在且可解析
@@ -69,7 +71,10 @@ def test_golden_loading() -> None:
     from app.eval.golden import load_golden, normalize
 
     cases, meta = load_golden()
-    check("golden 加载 13 条起步", len(cases) >= 13, f"实际 {len(cases)}")
+    check("golden 加载 ≥50 条", len(cases) >= 50, f"实际 {len(cases)}")
+    check("meta.case_count 与实际条数一致",
+          meta.get("case_count", len(cases)) == len(cases),
+          f"meta={meta.get('case_count')} 实际={len(cases)}")
     check("golden meta 含 schema", "schema" in meta)
 
     # normalize
@@ -102,15 +107,14 @@ def test_anchor_locate(tmp: Path) -> None:
 
     cases, _ = load_golden()
     locate_expected_chunks(cases, bm, tenant_id="tenant_demo")
-    located = [c for c in cases if c.located]
-    check("锚句定位成功（多数用例命中）", len(located) >= len(cases) * 0.8,
-          f"{len(located)}/{len(cases)}")
+    # 锚句定位失败的用例会被 metrics 静默剔出指标分母（题集缩水，recall 反而可能更好看），
+    # 因此这里要求 100% 可定位、零容忍——放宽到 80% 等于给"锚句写错/跨块"留后门。
+    missed = [c.id for c in cases if not c.located]
+    check("全部锚句可定位（100%，0 容忍）", not missed,
+          f"未定位 {len(missed)}/{len(cases)} 条：{missed[:8]}")
     # 每条定位到 ≥1 块
-    for c in located:
-        if not c.expected_chunk_ids:
-            check(f"用例 {c.id} 定位到非空块集", False)
-            return
-    check("所有已定位用例块集非空", True)
+    empty = [c.id for c in cases if c.located and not c.expected_chunk_ids]
+    check("所有已定位用例块集非空", not empty, f"{empty[:8]}")
     vs.close()
 
 

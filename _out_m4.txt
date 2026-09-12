@@ -1,0 +1,55 @@
+未配置 SERVICE_API_KEY → 鉴权关闭（仅限本地/内网 demo；生产必须配置）
+checkpointer 降级: 测试模式：强制内存检查点（无跨进程持久化）
+Building prefix dict from the default dictionary ...
+Loading model from cache C:\Users\ADMINI~1\AppData\Local\Temp\jieba.cache
+Loading model cost 0.397 seconds.
+Prefix dict has been built successfully.
+2026-09-12 16:46:34 | INFO    | pipeline | 入库完成 44ed318c4ecd437481a67f2509fc34be.md v1: 1 块（stored=1 skipped=0）
+2026-09-12 16:46:35 | INFO    | pipeline | 入库完成 c4486baa0bdd42339da76646ac867551.md v1: 1 块（stored=1 skipped=0）
+═══ M4 API 端到端验证（隔离 mock/stub）═══
+── 1. /health ──
+  ✔ health 200
+  ✔ vector/bm25 up
+  ✔ redis down 但 degraded（内存降级设计内）
+── 2. 上传入库 ──
+  ✔ 上传 202
+  ✔ 任务 done
+  ✔ 任务进度 100
+  ✔ 第二份 done
+── 3. /v1/chat 非流式 ──
+  ✔ 非流式 200
+  ✔ answer 非空
+  ✔ intent=kb_qa
+  ✔ citations 非空
+  ✔ request_id 透传
+  ✔ latency_ms>0
+── 4. SSE 事件流 ──
+  ✔ SSE HTTP 200
+  ✔ 含 ready
+  ✔ 含 done
+  ✔ done 前事件合法
+  ✔ token 拼接 == done.answer
+  ✔ done.citations 与 citation 事件一致
+  ✔ 多轮指代可答
+── 5. 对话历史 ──
+  ✔ 历史含 user+assistant
+  ✔ 历史条数上限截断
+── 6. 错误路径 ──
+  ✔ 空 question → 422
+  ✔ thread 租户不匹配 → 422
+  ✔ 不支持类型 → 415
+  ✔ 任务不存在 → 404
+── 7. 幂等重传与软删除 ──
+  ✔ 同内容重传 → 200 duplicated
+  ✔ DELETE → 204
+  ✔ 重复 DELETE 幂等 → 204
+  ✔ 删除不存在 → 404
+── 8. /v1/debug/retrieve ──
+  ✔ debug 200
+  ✔ debug fused 非空
+  ✔ fused 字段完整
+  ✔ filters 含 is_valid
+── 9. 删除后检索隔离 ──
+  ✔ 被删文档块不出现在现行检索
+
+结果: 35 通过 / 0 失败

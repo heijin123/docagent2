@@ -180,14 +180,16 @@ def main() -> int:
     lock = threading.Lock()
     t0 = time.perf_counter()
 
-    def run_chat():
+    # worker 必须把 idx 作为参数接收：提交语句里的推导式变量属于推导式
+    # 自己的作用域，闭包取不到（否则 NameError: name 'idx' is not defined）。
+    def run_chat(idx: int) -> list[dict]:
         out = []
         for i in range(args.rounds):
             q = args.query or QUERIES[(i + idx) % len(QUERIES)]
             out.append(_chat_once(args.base, q, idx, f"tenant_demo:loadtest{idx}"))
         return out
 
-    def run_ingest():
+    def run_ingest(idx: int) -> list[dict]:
         files = sorted(Path(args.samples_dir).glob("*"))
         files = [f for f in files if f.suffix.lower() in
                  (".pdf", ".docx", ".md", ".txt")]
@@ -195,10 +197,9 @@ def main() -> int:
             return [{"status": -1, "duration_ms": 0, "err": "无样例文件"}]
         return [_ingest_once(args.base, files[idx % len(files)], idx)]
 
-    total = args.concurrency if args.mode == "ingest" else args.concurrency
     worker = run_chat if args.mode == "chat" else run_ingest
-    with ThreadPoolExecutor(max_workers=total) as ex:
-        futs = [ex.submit(worker) for idx in range(total)]
+    with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futs = [ex.submit(worker, idx) for idx in range(args.concurrency)]
         for fut in as_completed(futs):
             with lock:
                 results.extend(fut.result())

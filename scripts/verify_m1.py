@@ -6,6 +6,7 @@
 3. chunking：块长护栏 / table·code 整块不切断 / 溯源键齐全 / 版本段 chunk_id
 4. PDF 质量门：绿页放行 / 红页（纯图/乱码）判级
 5. 幂等入库：首灌全写 / 重灌全 skip / 内容变更版本化软更新（旧版 is_valid=false）
+   / --rebuild 强制版本化重灌（新块保持有效，不清空索引）
 6. 降级标注：无 Key → degraded=mock 且报告明示
 """
 from __future__ import annotations
@@ -186,6 +187,21 @@ def main() -> int:
             include=["metadatas"])
         check("v1 物理保留（Append-Only）", len(all_v1["ids"]) > 0
               and all(m["is_valid"] is False for m in all_v1["metadatas"]))
+
+        # --rebuild 回归（曾静默清空整个索引）：旧实现写 old_version = version if rebuild
+        # else version-1，当 action=="new" 时 old_version 恰等于刚写入的版本 → 新块被自己
+        # 翻成 is_valid=false，检索全空、且无任何报错。正确语义：同 hash 也强制 bump 版本，
+        # 只让「上一个版本」失效。
+        r4 = pl.run_document(src, rebuild=True)
+        check("--rebuild 强制版本化（version 递增）", r4["version"] == 3 and r4["stored"] > 0, str(r4))
+        kept = store.query([0.0] * 256, top_k=20, where={"$and": [
+            {"doc_id": {"$eq": doc_id}},
+            {"is_valid": {"$eq": True}}]})
+        check("--rebuild 后新块仍有效期（检索非空）", len(kept) > 0, f"valid_chunks={len(kept)}")
+        check("--rebuild 后仅最新版本有效",
+              {h["metadata"]["version"] for h in kept} == {3},
+              str({h["metadata"]["version"] for h in kept}))
+        check("--rebuild 后 BM25 侧同样保留新块", bm.count() > 0, f"bm25_valid={bm.count()}")
 
         # 不支持格式隔离
         bad = tmp_path / "bad.xyz"

@@ -37,16 +37,16 @@
 
 | 能力 | 说明 |
 |---|---|
-| LangGraph 六节点图 | `ingest → supervisor → (rewrite → retrieve → answer → verify)⁎ → finalize` + direct_reply/handoff/retry（契约 §4.1 节点清单） |
-| 意图路由（F3.1） | supervisor pydantic + Literal 枚举（kb_qa/chitchat/human_handoff），temp=0 |
+| LangGraph 图 | `ingest → (chitchat→direct_reply | human_handoff→handoff | 其余→rewrite→retrieve→answer(合并意图)→verify) → finalize` + retry 回环（契约 §4.1 节点清单） |
+| 意图路由（F3.1，已合并） | 意图分类合并进 answer 节点（同一次 LLM 调用产出 intent+answer）；明确寒暄/转人工由 `rule_classify_intent` 规则短路（零 LLM），Literal 枚举 kb_qa/chitchat/human_handoff |
 | 查询改写（F3.2） | 结合对话历史消歧，无历史透传；过期确认的自然语言放行（"是/查看"→ include_expired） |
 | 检索节点（F3.3） | 挂 F2 HybridRetriever；仅命中过期 → 发确认话术（无 interrupt，F2.8） |
 | Answer（F3.4/F3.9） | 强制 `[来源: 文档 页码]` 引用格式 + 引用只允许来自证据（防编造）；资料不足直说；过期引用失效提示规则进 prompt |
 | Verify（F3.5/F3.9） | 独立校验（输入只含引用内容+答案，不给思维链）；含过期引用 → confidence ≤0.5；纯过期支撑 → degraded=true |
 | 防死循环（F3.6/F3.8） | 置信度/重试判定全在条件边：verify 不达标且 retry<2 → rewrite 回环；超限 → handoff |
-| Handoff（F3.7） | 兜底话术 + degraded=true（supervisor 直达或 verify 兜底共用） |
+| Handoff（F3.7） | 兜底话术 + degraded=true（规则短路直达 / verify 兜底超限共用） |
 | 对话记忆（F4） | checkpointer 持久化（thread_id=`{tenant}:{user}`）；窗口截断最近 10 轮=20 条消息；每轮入口重置本轮输出字段防跨轮串扰 |
-| 双通道降级 | LLM：DashScope(qwen-plus, JSON 模式) / 无 Key→Stub 规则式（保链路回归）；checkpointer：RedisSaver / 不可达→InMemorySaver（降级不掩盖） |
+| 双通道降级 | LLM：DashScope（QWEN_LLM_MODEL 可配，JSON/流式双模式，现用 Qwen3.8-Flash）/ 无 Key→Stub 规则式（保链路回归）；checkpointer：RedisSaver / 不可达→InMemorySaver（降级不掩盖） |
 | 验证 | `verify_m3.py`：25 断言（三类意图路由 / 引用达标链 / 重试 2 次转人工 / 过期两轮流 / 记忆与窗口） |
 
 ## M4 已交付能力
@@ -79,13 +79,14 @@
 
 | 能力 | 说明 |
 |---|---|
-| golden 评估集 | `data/golden/qa_golden.json`：13 条起步（语义类/精确编号类/跨年份三类），每条 `query → 期望文档 + 锚句`；锚句归一化（全半角/空白/大小写）子串匹配全库定位期望块，**零人工标注块 id** |
+| golden 评估集 | `data/golden/qa_golden.json`：**55 条**（语义 / 精确编号 / 跨年份 / 改写稳健 / 噪声 五类），每条 `query → 期望文档 + 锚句`；锚句归一化（全半角/空白/大小写）子串匹配全库定位期望块，**零人工标注块 id**。锚句可定位性由 `scripts/verify_golden_anchors.py` 用真实解析+切块链路体检（55/55 命中） |
 | 检索层指标 | `app/eval/metrics.py`：recall@5（期望块进 top-k 的用例占比）+ MRR；锚句定位失败用例不计分母（F7.2） |
 | 答案层指标 | 引用可回查率——`citations.chunk_id` 必须属于检索命中块（F7.3，`--answers` 开启，需真 Key） |
 | 门槛判定 | 真实向量 recall@5 ≥ 0.8 → pass；mock 向量无语义 → 指标 SKIP 并标 degraded（F7.4） |
 | 报告 + CLI | `data/reports/eval_report_latest.json`（provider/degraded/逐用例明细）；`python -m app.cli eval [--answers] [--top-k K]` |
-| 实测 | 真实 DashScope：**recall@5=1.000 / MRR=1.000 / 13/13**（verdict=pass，远超门槛） |
-| 验证 | `verify_m6.py`：18 断言（golden 校验/normalize/锚句定位/mock SKIP/报告落盘/CLI） |
+| 实测 | 真实 DashScope 向量（`qwen3.7-text-embedding-flash`，1024 维；语料 38 文档 / 105 chunk）：**recall@5 = 0.855 / MRR = 0.791**，55 条全评估（verdict=pass）；题型分组 semantic 0.875 / paraphrase 1.000 / exact 0.750 / year 1.000 / noisy 0.000。同语料 **BM25 单路下界**（`scripts/bm25_probe.py`，无需 Key）recall@5=0.836 / MRR=0.673 → RRF 融合向量路 +0.019 / +0.118 |
+| 验证 | `verify_m6.py`：19 断言（golden 校验/normalize/锚句定位 100%/mock SKIP/报告落盘/CLI） |
+| 已知局限 | 语料 38 文档 / 105 chunk（top-5 覆盖率 4.8%）。**exact（数字/编号）0.750、noisy（口语改写）0.000 是两块短板**：干扰文档含同款关键词把 BM25 分数摊薄，口语问法又天然缺字面重叠——两者都靠向量路补偿，也正是 Hybrid 存在的理由。规模体检与题型分组见 `scripts/corpus_stats.py` / `scripts/bm25_probe.py`。答案层引用可回查率需 `--answers`（走真实 LLM，本轮未跑） |
 
 ## M7 已交付能力（Web 前端）
 
@@ -100,7 +101,9 @@
 
 ```bash
 uv sync --dev                 # 清华镜像，Python ≥3.13（.python-version 锁定 3.13）
-.venv/Scripts/python.exe scripts/make_samples.py   # 生成演示语料
+.venv/Scripts/python.exe scripts/make_samples.py      # 基础演示语料（5 份）
+.venv/Scripts/python.exe scripts/make_corpus.py       # 扩语料批次一：干扰项 + 格式覆盖（13 份）
+.venv/Scripts/python.exe scripts/make_corpus_long.py  # 扩语料批次二：长文档（20 份，撑大 chunk 数）
 .venv/Scripts/python.exe -m app.cli ingest data/samples   # 摄取（无 Key 自动 mock）
 .venv/Scripts/python.exe scripts/verify_m1.py       # M1 验证：41 断言
 .venv/Scripts/python.exe scripts/verify_m2.py       # M2 验证：30 断言
@@ -154,7 +157,7 @@ app/
 │   ├── schemas.py   # 节点结构化输出（intent Literal / verify）
 │   ├── prompts.py   # prompt 构建（JSON 示例一律 json.dumps；M4 加 answer_stream_prompt 纯文本模板）
 │   ├── llm.py       # DashScope / Stub 双通道（M4 加 stream_answer 流式）
-│   ├── nodes.py     # ingest/supervisor/rewrite/retrieve/answer/verify/retry/handoff/finalize（answer 支持 token_sink）
+│   ├── nodes.py     # ingest/rewrite/retrieve/answer(合并意图)/verify/retry/handoff/finalize（answer 支持 token_sink）
 │   ├── checkpointer.py # RedisSaver → InMemorySaver 降级工厂
 │   └── graph.py     # StateGraph 组装 + AgentApp（reply/history/stream_events）
 ├── api/             # M4 FastAPI 服务层
@@ -182,9 +185,10 @@ scripts/verify_m3.py     # M3 图编排验证断言
 scripts/verify_m4.py     # M4 API 端到端验证断言
 scripts/verify_m5.py     # M5 观测/部署验证断言
 scripts/verify_m6.py     # M6 评估验证断言
+scripts/verify_golden_anchors.py  # golden 锚句可定位性体检（免 chromadb，写用例时用）
 scripts/loadtest.py      # M5 压测脚本
 data/samples/            # 演示语料（md/txt/docx/pdf/含红页 pdf）
-data/golden/qa_golden.json  # 评估 golden 集（13 条起步）
+data/golden/qa_golden.json  # 评估 golden 集（55 条）
 data/chroma_db|bm25|registry.db|uploads  # 运行时数据（gitignore）
 ```
 
@@ -192,12 +196,12 @@ data/chroma_db|bm25|registry.db|uploads  # 运行时数据（gitignore）
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
-| M1 | 解析 + chunking + 质量门 + 双索引 + 幂等版本化 | ✅ 41/41 |
+| M1 | 解析 + chunking + 质量门 + 双索引 + 幂等版本化 | ✅ 45/45 |
 | M2 | 混合检索：向量 + BM25 并行 + RRF + 年份/时效过滤 | ✅ 30/30 |
-| M3 | LangGraph 多 Agent：supervisor/rewrite/retrieve/answer/verify/handoff + Redis checkpointer | ✅ 25/25（stub） |
+| M3 | LangGraph 多 Agent：rewrite/retrieve/answer(合并意图)/verify/handoff + Redis checkpointer | ✅ 25/25（stub） |
 | M4 | FastAPI：SSE 流式 + 文档上传 + 软删除 + debug/health | ✅ 35/35 |
-| M5 | 观测（JSON 日志+耗时埋点+慢操作）+ 压测脚本 + Docker/部署手册 | ✅ 29/29 |
-| M6 | 评估体系：golden recall@5/MRR + 引用可回查率 | ✅ 18/18 |
+| M5 | 观测（JSON 日志+耗时埋点+慢操作）+ 压测脚本 + Docker/部署手册 | ✅ 42/42 |
+| M6 | 评估体系：golden recall@5/MRR + 引用可回查率（题集 55 条 / 语料 38 文档 105 chunk） | ✅ 19/19 |
 | M7 | Web 前端：提问页（SSE 流式）+ 文档管理页（并发上传+进度） | ✅ 端到端实测 |
 
-> 已知工程坑（实现期实测）：Chroma `query_texts` 会触发默认模型下载 → 检索统一走显式 embedding；jieba 在 Py3.14 无 wheel 需锁 3.13（`.python-version`）；PyMuPDF 默认字体不含中文，生成语料需 `insert_font(fontfile=simhei.ttf)`；`VectorStore.query` 的 `top_k/where` 是 keyword-only，`asyncio.to_thread` 传参须用 lambda；BM25 SQL 占位符数必须与参数数动态匹配（permission 白名单长度可变）；**langgraph 须 ≥1.2.11**（旧版 langgraph 0.5.0 与 langchain-core 1.6 冲突报 MRO 错误，故须升到 1.2.11+）；langgraph-checkpoint-redis 取 0.5.x（0.5.2 验证可用）；pydantic v2 静默忽略 extra 字段——构造 ChunkRecord 时元数据键名必须精确（`effective_time` 写成 `eff` 会被丢弃且不报错）；checkpoint 跨轮持久化 → 每轮入口必须重置"本轮输出"字段（degraded/intent/citations 等），否则上一轮 handoff 状态串扰下一轮；**Py3.12+ `StopIteration` 不能经 `asyncio.to_thread` 的 Future 传播**（转 RuntimeError）→ SSE 迭代器用哨兵对象收尾；FastAPI 路由 prefix 若自带 `/v1` 再 include `prefix=/api/v1` 会双前缀 → 各 router 去掉版本段统一由 include 加；新版 FastAPI include_router 为 `_IncludedRouter` 惰性挂载（openapi 才可查完整路径）；**Windows 下 Chroma 的 sqlite 句柄延迟释放** → 测试用 `TemporaryDirectory` 清理会 `PermissionError [WinError 32]`，须 `mkdtemp + shutil.rmtree(ignore_errors=True)` 并在 `close()` 后手工清理。
+> 已知工程坑（实现期实测）：Chroma `query_texts` 会触发默认模型下载 → 检索统一走显式 embedding；jieba 在 Py3.14 无 wheel 需锁 3.13（`.python-version`）；PyMuPDF 默认字体不含中文，生成语料需 `insert_font(fontfile=simhei.ttf)`；`VectorStore.query` 的 `top_k/where` 是 keyword-only，`asyncio.to_thread` 传参须用 lambda；BM25 SQL 占位符数必须与参数数动态匹配（permission 白名单长度可变）；**langgraph 须 ≥1.2.11**（旧版 langgraph 0.5.0 与 langchain-core 1.6 冲突报 MRO 错误，故须升到 1.2.11+）；langgraph-checkpoint-redis 取 0.5.x（0.5.2 验证可用）；pydantic v2 静默忽略 extra 字段——构造 ChunkRecord 时元数据键名必须精确（`effective_time` 写成 `eff` 会被丢弃且不报错）；checkpoint 跨轮持久化 → 每轮入口必须重置"本轮输出"字段（degraded/intent/citations 等），否则上一轮 handoff 状态串扰下一轮；**Py3.12+ `StopIteration` 不能经 `asyncio.to_thread` 的 Future 传播**（转 RuntimeError）→ SSE 迭代器用哨兵对象收尾；FastAPI 路由 prefix 若自带 `/v1` 再 include `prefix=/api/v1` 会双前缀 → 各 router 去掉版本段统一由 include 加；新版 FastAPI include_router 为 `_IncludedRouter` 惰性挂载（openapi 才可查完整路径）；**Windows 下 Chroma 的 sqlite 句柄延迟释放** → 测试用 `TemporaryDirectory` 清理会 `PermissionError [WinError 32]`，须 `mkdtemp + shutil.rmtree(ignore_errors=True)` 并在 `close()` 后手工清理。**`.env` 内联注释陷阱**：python-dotenv 只剥离「值非空」时后随的注释——`SERVICE_API_KEY=` 后直接跟 `#`（中间无实值）会把整段注释当成密钥 → 意外开启鉴权、接口全 401；该注释必须独立成行。**`ingest --rebuild` 曾静默清空索引**：旧实现 `old_version = version if rebuild else version-1`，当 `action=="new"` 时 `old_version` 恰等于刚写入的版本 → 新块被自己翻成 `is_valid=false`，检索返回空且无任何报错；现改为「同 hash 也强制 bump 版本重灌，只失效上一版本」，`verify_m1.py` 已加 4 条回归断言。

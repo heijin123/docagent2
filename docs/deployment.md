@@ -26,6 +26,15 @@ curl http://localhost:8000/api/v1/health
 - `status=degraded` + HTTP 200：Redis 不可达，已降级内存 checkpointer（跨会话记忆失效，但问答可用）。
 - `status=degraded` + HTTP 503：向量库或 BM25 不可用（**核心链路不可用，必须告警**）。
 
+> **容器配置的两点注意**
+> 1. `docker-compose.yml` 的 `environment:` 是**白名单**——只有列出的变量会注入容器。
+>    宿主机 `.env` 仅用于 compose 的 `${VAR}` 变量替换，**未在白名单登记的变量改了不起作用**。
+>    新增可调配置时请同步登记（`scripts/verify_m5.py` 会校验安全/限额关键项）。
+> 2. 镜像构建**不依赖 `uv.lock`**（本项目 `.gitignore` 忽略锁文件）：Dockerfile 用
+>    `COPY pyproject.toml` + `uv sync`（未加 `--frozen`），构建时在镜像内解析依赖并生成锁文件。
+>    若追求可复现构建，可提交 `uv.lock` 并改回 `COPY pyproject.toml uv.lock ./` + `--frozen`。
+> 3. 健康检查语义两边一致：**HTTP 503（degraded）也算存活**，只有进程不可达才判 unhealthy。
+
 ---
 
 ## 2. 配置项（关键）
@@ -40,7 +49,7 @@ curl http://localhost:8000/api/v1/health
 | `REDIS_CHECKPOINTER_ENABLED` | 1 | 1=用 Redis 跨会话；0=强制内存 |
 | `INGEST_WORKERS` | 1 | 入库线程数；**保持 1**（Chroma 并发写限制） |
 | `API_MAX_INFLIGHT` | 50 | 并发在途问答上限，超限 429 |
-| `MAX_UPLOAD_MB` | 50 | 单文件上传大小上限，超限 413 |
+| `MAX_UPLOAD_MB` | 50 | 单文件上传大小上限，超限 413（读前 `file.size` 预筛 + 流式计数兜底） |
 | `ALLOWED_ORIGINS` | `*` | CORS 白名单（逗号分隔域名）；生产收紧，本地默认 `*` |
 | `LOG_FORMAT` | json | json=生产日志采集；text=本地调试 |
 
@@ -49,10 +58,19 @@ curl http://localhost:8000/api/v1/health
 ## 3. 鉴权与安全
 
 1. **生产必须设置 `SERVICE_API_KEY`**（非空即启用 Bearer 鉴权，中间件校验）。
+   ⚠️ **不要写成 `SERVICE_API_KEY=   # 留空 = 关闭鉴权`** —— python-dotenv 只剥离「值非空」时后随的注释；`=` 后没有实值直接跟 `#` 时，整段 `# ...` 会被当作密钥值，导致**意外开启鉴权**、所有未带 key 的请求 401。注释必须独立成行，值留空即写成 `SERVICE_API_KEY=`。
 2. 客户端请求带 `Authorization: Bearer <key>` 与 `X-Tenant-Id`（多租户隔离）。
 3. `X-Tenant-Id` 决定向量/BM25 检索的 tenant 过滤；`thread_id` 前缀须与之一致（`{tenant}:{user}`），否则 422。
 4. CORS 由 `ALLOWED_ORIGINS`（逗号分隔域名）控制，默认 `*` 仅限内网 demo；**生产按域名收紧**（如 `ALLOWED_ORIGINS=https://a.example.com,https://b.example.com`）。
 5. 上传 `meta.permission` 不接受客户端传入（模型未定义该字段，防提权）；权限默认 `internal`。
+6. **上传大小两层防护**：应用层由 `MAX_UPLOAD_MB` 控制——先按 `file.size`（Starlette 解析 multipart 时统计的真实字节数，非客户端声明）预筛，再在分块读取中累加计数兜底（覆盖 chunked 传输与谎报长度），全程不把整份文件读进内存，超限返回 `413 DOC_TOO_LARGE`。
+   建议**网关层同步限制**，让超大请求在收包阶段就被掐断、根本进不了 Python 进程：
+
+   ```nginx
+   client_max_body_size 50m;   # 与 MAX_UPLOAD_MB 保持一致
+   ```
+
+   注意：nginx 值应 **≥** `MAX_UPLOAD_MB`，否则超限请求会先被 nginx 拦掉并返回 HTML 错误页，前端拿不到统一的 JSON 错误体。
 
 ---
 
@@ -109,7 +127,7 @@ curl http://localhost:8000/api/v1/health
 输出指标：吞吐（QPS）、延迟分位（p50/p90/p99/max）、错误率、SSE 事件分布。
 
 **参考基线**（本机 mock/stub，无网络）：
-- 单请求端到端 SSE（真实 DashScope）约 16.8s（4 次 LLM 往返，偏慢，见 §7 优化）。
+- 单请求端到端 SSE（真实 DashScope，合并前 qwen3.8-max）：约 16.8s（3 次 LLM 往返 supervisor+answer+verify，NFR P95≤8s 未达标）；现合并意图进 answer + 换 Qwen3.8-Flash 后 kb_qa 仅 2 次往返，延迟预期显著下降，待重新压测确认（见 §7）。
 - mock 模式下主要瓶颈在 Chroma 查询与 BM25 分词，QPS 取决于本机 CPU。
 
 > 压测前确认服务已灌入语料，否则 `chat` 会大量命中"资料不足→转人工"分支，延迟不代表真实负载。
@@ -120,7 +138,7 @@ curl http://localhost:8000/api/v1/health
 
 | 问题 | 现状 | 优化方向 |
 |---|---|---|
-| 全链路 16.8s | 4 次 LLM 往返（supervisor/rewrite/answer/verify）串行 | ① rewrite 仅在有上下文歧义时触发；② verify 可并行/采样；③ 流式 answer 已即时吐 token，感知延迟更低 |
+| 全链路延迟 | kb_qa 现 2 次 LLM 往返（answer[合并意图] / verify）串行；含改写歧义时 +1（rewrite） | ① supervisor 已合并进 answer 同一次调用（少一次往返）；② rewrite 仅在有上下文歧义时触发；③ verify 可并行/采样；④ 流式 answer 即时吐 token，感知延迟更低 |
 | 向量路 latency | Chroma 本地查询 | 已并行 BM25；大数据量评估 hnsw 参数 |
 | 入库串行 | 单写者 | 多文档 batch embed（embedding_batch_size） |
 

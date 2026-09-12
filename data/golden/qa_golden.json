@@ -3,8 +3,18 @@
     "schema": "1.0",
     "description": "Enterprise-QA-Agent golden 评估集：query → 期望文档 + 锚句（锚句用于全库定位期望块，零人工标注块 id）",
     "created": "2026-09-09",
+    "updated": "2026-09-12",
     "tenant_id": "tenant_demo",
-    "note": "锚句必须是入库 chunk 中的原文片段（归一化后子串匹配）；三类问题：语义类 / 精确编号类 / 跨年份类"
+    "case_count": 55,
+    "note": "锚句必须是入库 chunk 中的原文片段（归一化后子串匹配，归一化=全半角统一+去所有空白+小写）；锚句归一化后须 ≥6 字，否则 load_golden 直接抛错不跑。题集锚句全部取自 5 个原始样例文档（sample_guide.md / sample_notes.txt / sample_policy.docx / sample_manual.pdf；sample_scan_page.pdf 第 2 页为空绘图页、无文本，故不出题）；2026-09-12 扩充的干扰语料（33 份）不新增题目，仅用于压大检索分母。",
+    "type_legend": {
+      "semantic": "语义类：换说法召回，考察向量检索（问题用词与原文不同）",
+      "exact": "精确类：编号/术语/数字，考察 BM25 关键词命中",
+      "year": "跨年份类：问题含显式年份，考察 F2.9 年份感知两段式裁决与安全阀回退",
+      "paraphrase": "改写稳健性：同一锚句的口语化改写，用于检验召回对问法不敏感",
+      "noisy": "噪声鲁棒性：口语/冗余表达，用于检验 BM25 分词与向量语义的互补"
+    },
+    "known_limitation": "① 同一锚句被多条用例复用时，这些用例的召回结果高度相关（不是独立样本）。② 语料已于 2026-09-12 扩至 38 文档 / 105 chunk，top-5 覆盖率由 45.5% 降至 4.8%，recall@5 / MRR 已具备区分度（BM25 单路下界 recall@5=0.836 / MRR=0.673，见 scripts/bm25_probe.py）；但真实向量路指标仍需配置 DASHSCOPE_API_KEY 后复测，mock embedding 下检索层直接 SKIP。③ 强干扰文档（差旅报销 v1/v2、考勤制度、费用报销规范等）已使部分原题跌出 top-5，这批用例正是用来暴露检索短板的。"
   },
   "cases": [
     {
@@ -97,6 +107,300 @@
       "expected_doc": "sample_guide.md",
       "anchor": "一天至少打卡两次",
       "type": "semantic"
+    },
+    {
+      "id": "q014",
+      "query": "员工每天上班需要做什么考勤动作？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "员工每天上班需打卡",
+      "type": "semantic"
+    },
+    {
+      "id": "q015",
+      "query": "下班打卡有什么时间要求？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "下班时间不早于 18:00",
+      "type": "semantic"
+    },
+    {
+      "id": "q016",
+      "query": "每天最少要打几次卡？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "一天至少打卡两次",
+      "type": "semantic"
+    },
+    {
+      "id": "q017",
+      "query": "报销单编号一共几位数字？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "后接 6 位数字",
+      "type": "exact"
+    },
+    {
+      "id": "q018",
+      "query": "餐饮报销每天的额度是多少？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "餐饮 | 100/天 | 无需发票",
+      "type": "exact"
+    },
+    {
+      "id": "q019",
+      "query": "哪些报销项目不需要提供发票？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "100/天 | 无需发票",
+      "type": "semantic"
+    },
+    {
+      "id": "q020",
+      "query": "差旅报销的标准和凭证要求是什么？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "差旅 | 500/天 | 需发票",
+      "type": "semantic"
+    },
+    {
+      "id": "q021",
+      "query": "报销上限标准表里列了哪些报销项目？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "项目 | 上限 | 说明",
+      "type": "exact"
+    },
+    {
+      "id": "q022",
+      "query": "迟到判定的代码函数叫什么？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "def is_late(clock_in)",
+      "type": "exact"
+    },
+    {
+      "id": "q023",
+      "query": "迟到判定用的是什么比较条件？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "clock_in > datetime(9, 30)",
+      "type": "exact"
+    },
+    {
+      "id": "q024",
+      "query": "这份知识库说明文档的主标题是什么？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "企业知识库使用说明",
+      "type": "semantic"
+    },
+    {
+      "id": "q025",
+      "query": "上传文档后系统会执行哪些步骤？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "上传文档后系统会进行解析、切分与向量化",
+      "type": "semantic"
+    },
+    {
+      "id": "q026",
+      "query": "回答问题时会不会给出引用来源？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "回答问题时附带引用来源",
+      "type": "semantic"
+    },
+    {
+      "id": "q027",
+      "query": "新用户第一次使用应该先看什么？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "首次使用请先阅读《管理员手册》",
+      "type": "semantic"
+    },
+    {
+      "id": "q028",
+      "query": "检索不到结果的时候应该怎么排查？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "请检查文档是否已成功入库",
+      "type": "semantic"
+    },
+    {
+      "id": "q029",
+      "query": "休假制度适用于哪些员工？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "本制度适用于全体员工",
+      "type": "semantic"
+    },
+    {
+      "id": "q030",
+      "query": "请假申请由谁审批？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "由直属主管审批",
+      "type": "semantic"
+    },
+    {
+      "id": "q031",
+      "query": "年假和事假的审批人是谁？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "年假/事假 | 直属主管",
+      "type": "exact"
+    },
+    {
+      "id": "q032",
+      "query": "这份休假制度从什么时候开始执行？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "本制度自发布之日起试行",
+      "type": "semantic"
+    },
+    {
+      "id": "q033",
+      "query": "休假制度的解释权归哪个部门？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "解释权归人力资源部",
+      "type": "semantic"
+    },
+    {
+      "id": "q034",
+      "query": "这份经营分析报告的标题是什么？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "年度经营分析报告",
+      "type": "semantic"
+    },
+    {
+      "id": "q035",
+      "query": "报告覆盖了哪个时间段的数据？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "本报告覆盖上半年经营数据",
+      "type": "semantic"
+    },
+    {
+      "id": "q036",
+      "query": "报告分析了哪些财务指标？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "含营收、成本与毛利分析",
+      "type": "semantic"
+    },
+    {
+      "id": "q037",
+      "query": "成本方面的表现如何？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "成本控制在预算内",
+      "type": "exact"
+    },
+    {
+      "id": "q038",
+      "query": "早上几点之前必须打卡？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "上班时间不晚于 09:30",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q039",
+      "query": "打卡次数有没有最低要求？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "一天至少打卡两次",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q040",
+      "query": "公司规定的下班时间是什么时候？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "下班时间不早于 18:00",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q041",
+      "query": "考勤是不是按自然月计算的？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "考勤周期为自然月",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q042",
+      "query": "报销单号的前缀规范是什么？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "报销单编号规则：XB- 开头",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q043",
+      "query": "差旅费一天最多能报多少钱呀？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "差旅 | 500/天",
+      "type": "noisy"
+    },
+    {
+      "id": "q044",
+      "query": "吃饭的餐费报销有额度吗？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "餐饮 | 100/天 | 无需发票",
+      "type": "noisy"
+    },
+    {
+      "id": "q045",
+      "query": "报销金额多大需要总监签字？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "报销 5000 元以上需总监审批",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q046",
+      "query": "2023 年的年假规定是怎样的？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "年假按自然年计算，可跨年累计不超过 5 天",
+      "type": "year"
+    },
+    {
+      "id": "q047",
+      "query": "2024 年的报销单编号规则是什么？",
+      "expected_doc": "sample_guide.md",
+      "anchor": "后接 6 位数字",
+      "type": "year"
+    },
+    {
+      "id": "q048",
+      "query": "知识库支持导入哪些文件类型？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "支持 PDF、Word、Markdown 与纯文本格式",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q049",
+      "query": "回答会不会标注出处？",
+      "expected_doc": "sample_notes.txt",
+      "anchor": "回答问题时附带引用来源",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q050",
+      "query": "人员范围上，休假制度管到哪些人？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "本制度适用于全体员工",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q051",
+      "query": "事假需要找谁批准？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "年假/事假 | 直属主管",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q052",
+      "query": "病假超过三天谁来批？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "病假(>3天) | 部门总监",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q053",
+      "query": "这份制度什么时候开始试行？",
+      "expected_doc": "sample_policy.docx",
+      "anchor": "本制度自发布之日起试行",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q054",
+      "query": "上半年营收表现如何？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "营收同比增长 12%",
+      "type": "paraphrase"
+    },
+    {
+      "id": "q055",
+      "query": "上半年毛利表现如何？",
+      "expected_doc": "sample_manual.pdf",
+      "anchor": "毛利提升至 28%",
+      "type": "paraphrase"
     }
   ]
 }

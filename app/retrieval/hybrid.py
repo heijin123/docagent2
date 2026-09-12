@@ -340,7 +340,7 @@ class HybridRetriever:
                 "vector_hits": relaxed["vector_hits"], "bm25_hits": relaxed["bm25_hits"]}
             result.degraded.extend(relaxed["degraded"])
             result.used_roads = relaxed["used_roads"] or result.used_roads
-        duration_ms = span.stop()
+        duration_ms = span.stop(log_slow=False)
         log_slow_query("", query, duration_ms,
                        used_roads=result.used_roads, hits=len(result.items))
         return result
@@ -449,7 +449,7 @@ class HybridRetriever:
             if result.expired_candidates:
                 result.notes.append("现行资料不足，命中过期文档 → 需用户确认后查看")
             result.degraded.extend(relaxed["degraded"])
-        duration_ms = span.stop()
+        duration_ms = span.stop(log_slow=False)
         log_slow_query("", query, duration_ms,
                        used_roads=result.used_roads, hits=len(result.items))
         return result

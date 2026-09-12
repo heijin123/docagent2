@@ -10,14 +10,18 @@ ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /usr/local/bin/uv
 
 WORKDIR /app
-# 先复制依赖清单，利用缓存层
-COPY pyproject.toml uv.lock ./
-RUN uv sync --no-dev --no-install-project --frozen
+# 先复制依赖清单，利用缓存层。
+# 注意：本项目 .gitignore 忽略 uv.lock（不提交锁文件），故这里不能 COPY uv.lock
+# 也不能用 --frozen（缺锁文件会直接构建失败）。uv sync 会在构建时解析依赖并在
+# 镜像内生成 uv.lock。若日后要可复现构建：把 uv.lock 移出 .gitignore 并提交，
+# 再把下面两处改为 `COPY pyproject.toml uv.lock ./` + `--frozen`。
+COPY pyproject.toml ./
+RUN uv sync --no-dev --no-install-project
 
 # 复制源码
 COPY app ./app
 COPY scripts ./scripts
-RUN uv sync --no-dev --frozen
+RUN uv sync --no-dev
 
 # ── runtime ──────────────────────────────────────────────
 FROM python:3.13-slim AS runtime

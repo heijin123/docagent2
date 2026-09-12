@@ -1,6 +1,6 @@
 """LangGraph 节点实现（F3.1–F3.9 + F4 记忆接线）。
 
-节点清单与契约 §4.1 一致：ingest → supervisor → (rewrite → retrieve → answer → verify)* → finalize；
+节点清单与契约 §4.1 一致：ingest → (chitchat→direct_reply | human_handoff→handoff | 其余→rewrite → retrieve → answer[合并意图] → verify)* → finalize；
 分支（意图路由 / 置信度 / 重试上限）全部在 graph.py 条件边里（F3.8：确定性逻辑不走 LLM）。
 """
 from __future__ import annotations
@@ -18,6 +18,10 @@ CONFIRM_TEMPLATE = (
     "知识库中该主题的现行资料不足；找到相关文档《{title}》"
     "已于 {date} 过期，是否仍要查看？（内容可能不适用当前情况）"
 )
+
+_GREETING = "你好！我是企业知识助手，可查询制度、流程、政策等资料。请直接描述你的问题。"
+_HANDOFF_MSG = ("抱歉，这个问题我无法基于现有知识库可靠回答。已为你转接人工客服，"
+               "请描述你的工单信息以便跟进。")
 
 
 def _fmt_ts(ts: int) -> str:
@@ -66,22 +70,10 @@ class QANodes:
         msgs = list(state.get("messages", []))
         return prompts.render_history(msgs[:-1], max_rounds=self.history_rounds)
 
-    # ── F3.1 supervisor ──────────────────────────────────────
-    def supervisor(self, state: AgentState) -> dict:
-        # F3.8 确定性短路：明确寒暄/转人工关键词直接定 intent（省一次 LLM）
-        rule_intent = prompts.rule_classify_intent(state["query"])
-        if rule_intent:
-            return {"intent": rule_intent,
-                    "notes": [*state.get("notes", []),
-                              f"intent={rule_intent}（规则短路，未走 LLM）"]}
-        system, user = prompts.supervisor_prompt(state["query"], self._history(state))
-        out: schemas.SupervisorIntent = self.llm.complete_json(
-            system, user, schemas.SupervisorIntent, temperature=0.0)
-        if out.intent not in ("kb_qa", "chitchat", "human_handoff"):
-            logger.warning("supervisor 产出非法 intent=%r → 强制 kb_qa", out.intent)
-            out.intent = "kb_qa"
-        return {"intent": out.intent,
-                "notes": [*state.get("notes", []), f"intent={out.intent}（{out.reason}）"]}
+    # ── F3.1 supervisor（已合并进 answer 节点，意图分类见 answer）────
+    # 说明：意图分类不再单独走一次 LLM，而是由 answer 节点在生成回答的同一次调用里
+    # 一并产出 intent（prompt 要求首行 <intent> 或 JSON 含 intent）；明确寒暄/转人工
+    # 仍由 rule_classify_intent 规则短路（零 LLM）。下方 answer 方法即合并实现。
 
     # ── F3.2 rewrite（含 F2.8 过期确认放行）────────────────────
     def rewrite(self, state: AgentState) -> dict:
@@ -139,7 +131,7 @@ class QANodes:
                 "confirmation_needed": confirmation_needed,
                 "notes": new_notes}
 
-    # ── F3.4 answer（F3.9 过期提示规则在 prompt；确认话术在此）──
+    # ── F3.4 answer（合并 supervisor：意图分类 + 生成回答，单次 LLM）──
     def answer(self, state: AgentState) -> dict:
         if state.get("confirmation_needed"):
             cands = state.get("expired_candidates", [])
@@ -150,16 +142,25 @@ class QANodes:
                 else "未知时间")
             if self.token_sink:
                 self.token_sink(ans)  # 确认话术也作为 token 放送（前端拼接一致）
-            return {"answer": ans, "citations": [], "notes": [*state.get("notes", []),
-                    "仅命中过期文档 → 已向用户发起确认（F2.8，无 interrupt）"]}
+            return {"intent": "kb_qa", "answer": ans, "citations": [],
+                    "notes": [*state.get("notes", []),
+                             "仅命中过期文档 → 已向用户发起确认（F2.8，无 interrupt）"]}
 
         q = state.get("rewritten_query") or state["query"]
+        # 合并 supervisor：明确寒暄/转人工走规则短路（零 LLM）；其余进 kb_qa 合并调用
+        rule_intent = prompts.rule_classify_intent(q)
+        if rule_intent == "chitchat":
+            return {"intent": "chitchat", "answer": _GREETING, "citations": [],
+                    "notes": [*state.get("notes", []), "answer: chitchat 规则短路（合并 supervisor）"]}
+        if rule_intent == "human_handoff":
+            return {"intent": "human_handoff", "answer": _HANDOFF_MSG, "citations": [],
+                    "degraded": True,
+                    "notes": [*state.get("notes", []), "answer: human_handoff 规则短路（合并 supervisor）"]}
+
         evidence = prompts.render_evidence(state.get("retrieved", []))
-        retry_hint = ""
-        if state.get("retry_count", 0) > 0:
-            retry_hint = "请补充引用或修正回答使校验通过"
+        retry_hint = "请补充引用或修正回答使校验通过" if state.get("retry_count", 0) > 0 else ""
         if self.token_sink:
-            # M4 流式路径：纯文本逐段产出 → 引用反解（见 llm.stream_answer）
+            # M4 流式路径：首行 <intent> 标签被流式回调解析用于路由，正文照常逐段产出
             system, user = prompts.answer_stream_prompt(
                 q, evidence, self._history(state),
                 include_expired=bool(state.get("include_expired")), retry_hint=retry_hint)
@@ -170,9 +171,12 @@ class QANodes:
                 q, evidence, self._history(state),
                 include_expired=bool(state.get("include_expired")), retry_hint=retry_hint)
             out = self.llm.complete_json(system, user, schemas.AnswerOutput, temperature=0.2)
+        intent = out.intent or "kb_qa"
+        if intent not in ("kb_qa", "chitchat", "human_handoff"):
+            intent = "kb_qa"
         citations = self._enrich_citations(out.chunk_ids, state.get("retrieved", []))
-        return {"answer": out.answer, "citations": citations,
-                "notes": [*state.get("notes", []), f"citations={len(citations)}"]}
+        return {"intent": intent, "answer": out.answer, "citations": citations,
+                "notes": [*state.get("notes", []), f"intent={intent}", f"citations={len(citations)}"]}
 
     @staticmethod
     def _enrich_citations(chunk_ids: list[str], retrieved: list[dict]) -> list[dict]:
@@ -228,13 +232,11 @@ class QANodes:
         return {"retry_count": n, "notes": [*state.get("notes", []), f"retry #{n}"]}
 
     def direct_reply(self, state: AgentState) -> dict:
-        ans = "你好！我是企业知识助手，可查询制度、流程、政策等资料。请直接描述你的问题。"
-        return {"answer": ans, "citations": [], "degraded": False}
+        return {"answer": _GREETING, "citations": [], "degraded": False, "intent": "chitchat"}
 
     def handoff(self, state: AgentState) -> dict:
-        ans = ("抱歉，这个问题我无法基于现有知识库可靠回答。已为你转接人工客服，"
-               "请描述你的工单信息以便跟进。")
-        return {"answer": ans, "citations": [], "degraded": True,
+        return {"answer": _HANDOFF_MSG, "citations": [], "degraded": True,
+                "intent": "human_handoff",
                 "notes": [*state.get("notes", []), "degraded=true（handoff）"]}
 
     # ── 收尾：assistant 消息入历史（F4.2 供下一轮 QueryRewrite/Answer）──

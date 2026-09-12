@@ -6,6 +6,11 @@
 - 409 同 doc_key 处理中 → INGEST_IN_PROGRESS。
 
 meta.permission 不接受客户端传入（模型未定义该字段 → 自动忽略，防提权）。
+
+上传大小两层防护（都发生在写入 uploads 之前，且全程不把整份文件物化进内存）：
+- 读前预筛：`file.size`（Starlette 解析时统计的真实字节数，非客户端声明）超限 → 413；
+- 读中兜底：分块读取累加计数超限 → 413（覆盖 chunked 无 Content-Length / 谎报长度）；
+- 分块读取同时增量算 sha256，替代 `sha256(整块 bytes)`；落盘亦分块。
 """
 from __future__ import annotations
 
@@ -36,6 +41,17 @@ _MIME_OK = {
     ".md": {"text/markdown", "text/plain", "application/octet-stream"},
     ".txt": {"text/plain", "text/markdown", "application/octet-stream"},
 }
+
+# 流式读写分块大小：上传处理全程内存占用恒定在该量级，不随文件大小增长
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def _too_large(actual_bytes: int) -> ApiError:
+    """统一构造 413：读前预筛与流式计数共用，避免两处文案漂移。"""
+    mb = actual_bytes / (1024 * 1024)
+    return ApiError("DOC_TOO_LARGE",
+                    f"文件大小 {mb:.1f}MB 超过上限 {settings.max_upload_mb}MB", 413,
+                    {"max_upload_mb": settings.max_upload_mb})
 
 
 def _validate_ext(filename: str, content_type: str) -> str:
@@ -79,16 +95,31 @@ async def upload_document(
     rid = get_request_id(request)
 
     ext = _validate_ext(file.filename or "", file.content_type or "")
-    raw = await file.read()
-    if not raw:
-        raise ApiError("VALIDATION_INVALID_ARGUMENT", "上传文件为空", 422)
     max_bytes = settings.max_upload_mb * 1024 * 1024
-    if len(raw) > max_bytes:
-        mb = len(raw) / (1024 * 1024)
-        raise ApiError("DOC_TOO_LARGE",
-                       f"文件大小 {mb:.1f}MB 超过上限 {settings.max_upload_mb}MB", 413,
-                       {"max_upload_mb": settings.max_upload_mb})
-    content_hash = hashlib.sha256(raw).hexdigest()
+
+    # ── 第一层：读前预筛。file.size 是 Starlette 解析 multipart 时统计的真实字节数
+    #    （不是客户端声明的 Content-Length，无法伪造）；此刻数据已在 SpooledTemporaryFile
+    #    （>1MB 落磁盘），所以这一步不额外占用内存。
+    if file.size is not None and file.size > max_bytes:
+        raise _too_large(file.size)
+
+    # ── 第二层：分块流式读取。不再一次性 read() 整份文件（那会把整块内容物化进内存，
+    #    大小上限本身形同虚设）；改为逐块累加并增量算 sha256，内存恒定在 _UPLOAD_CHUNK_BYTES。
+    #    计数同时兜住 chunked 传输（无 Content-Length）与谎报长度的情况。
+    digest = hashlib.sha256()
+    total_bytes = 0
+    while True:
+        piece = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not piece:
+            break
+        total_bytes += len(piece)
+        if total_bytes > max_bytes:
+            raise _too_large(total_bytes)
+        digest.update(piece)
+
+    if total_bytes == 0:
+        raise ApiError("VALIDATION_INVALID_ARGUMENT", "上传文件为空", 422)
+    content_hash = digest.hexdigest()
 
     parsed_meta = DocumentMeta()
     if meta:
@@ -124,7 +155,14 @@ async def upload_document(
 
     # ── 202：新文档 / 变更 / 删后重传 → 后台任务 ──────────
     file_path = _safe_tenant_dir(tenant_id) / f"{uuid.uuid4().hex}{ext}"
-    file_path.write_bytes(raw)
+    # 回退到 spool 开头，再分块落盘（同样不整块进内存）
+    await file.seek(0)
+    with file_path.open("wb") as out:
+        while True:
+            piece = await file.read(_UPLOAD_CHUNK_BYTES)
+            if not piece:
+                break
+            out.write(piece)
     try:
         rec = services.task_manager.submit(
             tenant_id=tenant_id, doc_key=doc_key, doc_id=doc_id, file_path=file_path)

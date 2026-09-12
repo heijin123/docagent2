@@ -118,8 +118,22 @@ def gen_pdf(path: Path, with_scan_page: bool = False) -> None:
         page2 = doc.new_page()
         page2.draw_rect(pymupdf.Rect(60, 120, 500, 500), color=(0.2, 0.2, 0.2), width=1.5)
         page2.insert_textbox(pymupdf.Rect(80, 130, 480, 480), "", fontsize=12)
-    doc.save(str(path))
+
+    # 字体子集化：insert_font 会整包嵌入中文字体（simhei ≈ 9.3MB），
+    # 子集化后仅保留用到的字形（~9.7MB → ~13KB），中文抽取不受影响。
+    staging = path.with_name(path.name + ".stage")
+    doc.save(str(staging), garbage=4, deflate=True)
     doc.close()
+    if font_file:
+        try:
+            with pymupdf.open(str(staging)) as sub:
+                sub.subset_fonts()
+                sub.save(str(path), garbage=4, deflate=True)
+            staging.unlink()
+            return
+        except Exception as exc:  # noqa: BLE001 —— 缺 fontTools 等，回退不阻断
+            print(f"  [warn] {path.name} 字体子集化失败，保留未子集版本：{exc}")
+    staging.replace(path)
 
 
 def main() -> None:

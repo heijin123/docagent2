@@ -1,0 +1,42 @@
+checkpointer 降级: 测试模式：强制内存检查点（无跨进程持久化）
+Building prefix dict from the default dictionary ...
+Loading model from cache C:\Users\ADMINI~1\AppData\Local\Temp\jieba.cache
+Loading model cost 0.380 seconds.
+Prefix dict has been built successfully.
+checkpointer 降级: 测试模式：强制内存检查点（无跨进程持久化）
+checkpointer 降级: 测试模式：强制内存检查点（无跨进程持久化）
+checkpointer 降级: 测试模式：强制内存检查点（无跨进程持久化）
+checkpointer 降级: 测试模式：强制内存检查点（无跨进程持久化）
+═══ M3 LangGraph 多 Agent 验证（Stub LLM + 内存检查点）═══
+── 1. supervisor 意图路由 ──
+  ✔ chitchat: intent=chitchat
+  ✔ chitchat: 不检索不引用
+  ✔ chitchat: 非 degraded
+  ✔ handoff: intent=human_handoff
+  ✔ handoff: degraded=true
+  ✔ handoff: 兜底话术
+── 2. kb_qa 全链（检索→生成→verify 达标）──
+  ✔ kb_qa: intent=kb_qa
+  ✔ kb_qa: 有引用
+  ✔ kb_qa: 引用 validity=valid
+  ✔ kb_qa: 答案含 [来源: 标记
+  ✔ kb_qa: 置信度达标
+  ✔ kb_qa: 非 degraded
+── 3. verify 永不达标 → 重试 2 次 → handoff ──
+  ✔ verify 恰好调用 max_retry+1 次(3)
+  ✔ 最终 degraded=true（handoff）
+  ✔ answer 为兜底话术
+  ✔ 历史末条 assistant degraded 标注
+── 4. F2.8 过期文档：确认话术 → 用户放行 → 带失效标注 ──
+  ✔ 仅过期: 走确认话术
+  ✔ 仅过期: 无 citation（未放行不引用）
+  ✔ 放行后: 引用 validity=expired
+  ✔ 放行后: citation 带 expired_at
+  ✔ 纯过期支撑: degraded=true
+── 5. 多轮记忆 + 历史窗口（F4.2/F4.3）──
+  ✔ 两轮后历史 4 条
+  ✔ 含指代轮次 rewrite 携带历史上下文
+  ✔ 12 轮后历史封顶 20 条
+  ✔ 窗口保留最近 10 轮（user 恰 10 条，最早 2 轮被截断）
+
+结果: 25 通过 / 0 失败

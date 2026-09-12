@@ -1,0 +1,9 @@
+checkpointer 降级: 测试模式：强制内存检查点（无跨进程持久化）
+[1] LLM 计量 OK：complete→24tok，累计→38tok
+[2] AgentApp.reply 单轮 usage={'prompt_tokens': 595, 'completion_tokens': 40, 'total_tokens': 635}  intent=kb_qa
+[3] 两次 reply 累计：635 → 1272 tok；第二轮 usage={'prompt_tokens': 597, 'completion_tokens': 40, 'total_tokens': 637}
+[4] 定价命中 OK：Qwen3.8-Flash=0.0008/0.0027 ¥/1K；3549tok 预估 ¥0.0050
+    （对照 qwen3.8-max=0.02/0.06 ¥/1K；同量 ¥0.1166，flash 约为 max 的 4.3%）
+[5] 结构化成本日志 OK：捕获 6 条 event=llm_usage
+
+全部验收通过 ✅

@@ -59,7 +59,26 @@ class Settings:
     embedding_batch_size: int = field(default_factory=lambda: _env_int("EMBED_BATCH_SIZE", 10))
     max_retries: int = field(default_factory=lambda: _env_int("EMBED_MAX_RETRIES", 3))
     connect_timeout_s: int = field(default_factory=lambda: _env_int("HTTP_CONNECT_TIMEOUT_S", 5))
-    read_timeout_s: int = field(default_factory=lambda: _env_int("HTTP_READ_TIMEOUT_S", 60))
+    # LLM 读取超时：qwen 长请求（含完整 evidence 的 answer/verify）常 >60s，
+    # 旧默认 60s 触发 SDK 默认 2 次重试 → 同一 prompt 被发 3 次、烧 3 倍 token。
+    # 提至 120s 给长请求一次成功机会；配合 llm_max_retries=0 杜绝静默重发。
+    read_timeout_s: int = field(default_factory=lambda: _env_int("HTTP_READ_TIMEOUT_S", 120))
+    # LLM 客户端重试：默认 0（关掉 OpenAI SDK 默认的 2 次静默重试）。
+    # 重试交由业务层可控退避，避免「为成功率无视价格」地偷偷重发整段 prompt。
+    llm_max_retries: int = field(default_factory=lambda: _env_int("LLM_MAX_RETRIES", 0))
+
+    # ── LLM 定价（估算基线，CNY / 1K tokens，输入/输出）─────────
+    # 以 DashScope 官网最新价格为准；此处仅作成本可见化的估算基线。
+    # 价格随模型迭代变动频繁，请定期核对 https://help.aliyun.com/zh/model-studio/models
+    llm_pricing: dict = field(default_factory=lambda: {
+        "qwen-turbo": (0.003, 0.006),
+        "qwen-plus": (0.004, 0.012),
+        "qwen-max": (0.02, 0.06),
+        "qwen-long": (0.0005, 0.002),
+        # Qwen3.8-Flash 北京按量（2026-08-27 调价后）：0.8 / 2.7 元每百万 tokens
+        "qwen-flash": (0.0008, 0.0027),
+        "default": (0.01, 0.03),
+    })
 
     # ── Chunking（需求 F1.2）──────────────────────────────
     chunk_size_tokens: int = field(default_factory=lambda: _env_int("CHUNK_SIZE_TOKENS", 512))
@@ -105,6 +124,25 @@ class Settings:
     @property
     def has_api_key(self) -> bool:
         return bool(self.dashscope_api_key.strip())
+
+    def llm_price(self, model: str | None = None) -> tuple[float, float]:
+        """返回 (输入单价, 输出单价) CNY/1K tokens；按模型名关键字匹配定价表。
+
+        优先级：turbo > plus > long > max > default（qwen3.8-max 命中 'max'）。
+        """
+        m = (model or self.qwen_llm_model).lower()
+        table = self.llm_pricing
+        if "turbo" in m:
+            return table["qwen-turbo"]
+        if "plus" in m:
+            return table["qwen-plus"]
+        if "long" in m:
+            return table["qwen-long"]
+        if "flash" in m:
+            return table["qwen-flash"]
+        if "max" in m:
+            return table["qwen-max"]
+        return table["default"]
 
     @property
     def allowed_origins_list(self) -> list[str]:

@@ -1,12 +1,16 @@
 """LangGraph 图组装（F3 编排 + F4.1 checkpointer）+ 对话运行入口。
 
-图：START → ingest → supervisor ─┬─ chitchat → direct_reply ─┐
-                                 ├─ human_handoff → handoff ─┼→ finalize → END
-                                 └─ kb_qa → rewrite → retrieve → answer ─┬─ ask_expired → finalize
-                                                                          └─ ok → verify ─┬─ ok → finalize
-                                                                                           ├─ retry → retry → rewrite（回环）
-                                                                                           └─ handoff → handoff
+图：START → ingest ─┬─ chitchat(rule) → direct_reply ─┐
+                    ├─ human_handoff(rule) → handoff ─┤
+                    └─ 其余 → rewrite → retrieve → answer(合并意图) ─┬─ chitchat → finalize
+                                                                     ├─ human_handoff → handoff
+                                                                     ├─ confirm(仅过期) → finalize
+                                                                     └─ verify ─┬─ ok → finalize
+                                                                                ├─ retry → rewrite（回环）
+                                                                                └─ handoff → handoff
 分支全部走条件边（F3.8）：意图路由、过期确认分支、置信度/重试上限判定都是确定性代码。
+supervisor 的意图分类已合并进 answer 节点（同一次 LLM 调用产出 intent + answer），明确寒暄/
+转人工仍由 rule_classify_intent 规则短路（零 LLM）。
 """
 from __future__ import annotations
 
@@ -19,8 +23,10 @@ from langgraph.graph import END, START, StateGraph
 from app.agent.checkpointer import build_checkpointer
 from app.agent.llm import LLMClient, build_llm
 from app.agent.nodes import QANodes
+from app.agent import prompts
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.core.observability import TokenUsage
 from app.models.assistant import AssistantReply, Citation
 
 logger = logging.getLogger(__name__)
@@ -58,7 +64,6 @@ def build_qa_graph(
 
     g = StateGraph(AgentState)
     g.add_node("ingest", nodes.ingest)
-    g.add_node("supervisor", nodes.supervisor)
     g.add_node("rewrite", nodes.rewrite)
     g.add_node("retrieve", nodes.retrieve)
     g.add_node("answer", nodes.answer)
@@ -69,25 +74,39 @@ def build_qa_graph(
     g.add_node("finalize", nodes.finalize)
 
     g.add_edge(START, "ingest")
-    g.add_edge("ingest", "supervisor")
 
-    def _route_intent(state: AgentState) -> str:
-        return state.get("intent", "kb_qa")
+    def _entry_route(state: AgentState) -> Literal["direct_reply", "handoff", "rewrite"]:
+        # 合并 supervisor 的确定性短路：明确寒暄/转人工直接路由（零 LLM）；
+        # 其余（含歧义）进 rewrite→retrieve→answer，由 answer 节点在同一次调用里产出 intent。
+        ri = prompts.rule_classify_intent(state.get("query", ""))
+        if ri == "chitchat":
+            return "direct_reply"
+        if ri == "human_handoff":
+            return "handoff"
+        return "rewrite"
 
     g.add_conditional_edges(
-        "supervisor", _route_intent,
-        {"kb_qa": "rewrite", "chitchat": "direct_reply", "human_handoff": "handoff"},
+        "ingest", _entry_route,
+        {"direct_reply": "direct_reply", "handoff": "handoff", "rewrite": "rewrite"},
     )
 
     g.add_edge("rewrite", "retrieve")
     g.add_edge("retrieve", "answer")
 
-    def _route_after_answer(state: AgentState) -> Literal["ok", "ask_expired"]:
-        # F2.8：现行不足且仅命中过期 → 不生成答案，先发确认话术（无 verify）
-        return "ask_expired" if state.get("confirmation_needed") else "ok"
+    def _route_after_answer(state: AgentState) -> Literal["chitchat", "handoff", "confirm", "verify"]:
+        # answer 节点已合并产出 intent；据其路由（F2.8 仅过期确认 → 不 verify 直接 finalize）
+        intent = state.get("intent", "kb_qa")
+        if intent == "chitchat":
+            return "chitchat"
+        if intent == "human_handoff":
+            return "handoff"
+        return "confirm" if state.get("confirmation_needed") else "verify"
 
-    g.add_conditional_edges("answer", _route_after_answer,
-                            {"ok": "verify", "ask_expired": "finalize"})
+    g.add_conditional_edges(
+        "answer", _route_after_answer,
+        {"chitchat": "finalize", "handoff": "handoff",
+         "confirm": "finalize", "verify": "verify"},
+    )
 
     def _route_after_verify(state: AgentState) -> Literal["ok", "retry", "handoff"]:
         # F3.6/F3.8：确定性判定——置信度/grounded 达标即完成；未达标且未超上限→重试；超限→转人工
@@ -136,13 +155,16 @@ class AgentApp:
         if degraded and note:
             logger.warning("checkpointer 降级: %s", note)
         self._ckpt_degraded = degraded
+        self.last_usage = TokenUsage()  # 最近一轮 reply 的链路 token 用量
 
     def reply(self, query: str, thread_id: str, *,
               include_expired: bool = False) -> AssistantReply:
+        before = self.llm.meter.snapshot()
         state = self.graph.invoke(
             {"query": query, "include_expired": include_expired},
             thread_config(thread_id),
         )
+        self.last_usage = self.llm.meter.snapshot() - before
         return AssistantReply(
             answer=state.get("answer", ""),
             citations=[Citation(**c) for c in state.get("citations", [])],
@@ -150,6 +172,7 @@ class AgentApp:
             degraded=bool(state.get("degraded")),
             intent=str(state.get("intent", "kb_qa")),
             notes=list(state.get("notes", [])),
+            usage=self.last_usage.to_dict(),
         )
 
     def stream_events(self, query: str, thread_id: str, *,
@@ -175,10 +198,12 @@ class AgentApp:
 
         def _run() -> None:
             try:
+                before = self.llm.meter.snapshot()
                 state = graph.invoke(
                     {"query": query, "include_expired": include_expired},
                     thread_config(thread_id),
                 )
+                self.last_usage = self.llm.meter.snapshot() - before
                 sink_q.put(("state", state))
             except Exception as exc:  # noqa: BLE001 — SSE 通道内错误走 error 事件
                 logger.exception("stream 图执行异常 thread=%s", thread_id)
@@ -213,6 +238,7 @@ class AgentApp:
                         request_id=request_id,
                         latency_ms=int((time.time() - t0) * 1000),
                         notes=list(state.get("notes", [])),
+                        usage=self.last_usage.to_dict(),
                     )
                     # 非 LLM 直答路径（chitchat/handoff/资料不足拒答）无 token 事件 →
                     # done 前补发整段，保证"token 拼接 == done.answer"（前端零特判）。

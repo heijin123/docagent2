@@ -56,12 +56,24 @@ class IngestPipeline:
         self.registry = registry or DocRegistry()
 
     # ── 幂等分流（F1.8）────────────────────────────────────
-    def _decide(self, doc_key: str, content_hash: str, doc_id: str) -> dict:
-        """返回分流决策：{action: new|skip|retry|update|conflict, version, record}。"""
+    def _decide(self, doc_key: str, content_hash: str, doc_id: str,
+                *, force: bool = False) -> dict:
+        """返回分流决策：{action: new|skip|retry|update|conflict, version, record}。
+
+        force=True（--rebuild）：跳过「同 hash → skip」短路，强制版本化重灌
+        （version+1，得到全新 chunk_id）。用于文件未变但需重新解析的场景
+        （如 VLM 升级后补红页转录）；否则正常分流会走 skip 直接返回，rebuild 永不生效。
+        """
         existing = self.registry.get(self.tenant_id, doc_key)
         if existing is None:
             rec = self.registry.reserve(self.tenant_id, doc_key, doc_id, content_hash)
             return {"action": "new", "version": rec.version, "record": rec}
+
+        if force:
+            if existing.status == "processing":
+                return {"action": "conflict", "version": existing.version, "record": existing}
+            rec = self.registry.begin_version(self.tenant_id, doc_key, doc_id, content_hash)
+            return {"action": "update", "version": rec.version, "record": rec}
 
         if existing.content_hash == content_hash:
             if existing.is_deleted:
@@ -138,7 +150,7 @@ class IngestPipeline:
         report["doc_id"] = doc_id
 
         # ── 幂等分流 ──
-        decision = self._decide(doc_key, content_hash, doc_id)
+        decision = self._decide(doc_key, content_hash, doc_id, force=rebuild)
         version = decision["version"]
         report["version"] = version
 
@@ -211,9 +223,11 @@ class IngestPipeline:
         stored = self.vector_store.add(records, embeddings)
         self.bm25_store.add(records)
 
-        # 版本化软更新：先插新版本，再翻旧版本 is_valid=false（避免检索空窗，F1.7）
-        if decision["action"] == "update" or rebuild:
-            old_version = version - 1 if decision["action"] == "update" else version
+        # 版本化软更新：先插新版本，再翻旧版本 is_valid=false（避免检索空窗，F1.7）。
+        # 只在 action=="update" 时翻旧版本；切勿用 `or rebuild` 把 version 本身也翻掉——
+        # chunk_id = doc_id_version_index，同版本重灌会连刚写入的新块一起失效（检索全空）。
+        if decision["action"] == "update":
+            old_version = version - 1
             flipped_v = self.vector_store.soft_delete_doc(doc_id, old_version)
             self.bm25_store.soft_delete_doc(doc_id, old_version)
             if flipped_v:

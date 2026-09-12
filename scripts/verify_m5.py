@@ -4,8 +4,9 @@
 1. observability.TimedSpan 计时正确（>=0 且单调），log_slow_* 不抛异常
 2. logging JSON 格式输出合法 JSON 行（可被采集器解析）
 3. 检索/LLM/入库埋点真实生效（monkeypatch 校验慢操作日志触发路径）
-4. 压测脚本 CLI 可解析（--help 退出 0）
-5. 部署三件套存在且语法合法（Dockerfile/compose/手册关键章节）
+4. 压测脚本 CLI 可解析（--help 退出 0），且 worker 真能执行（防推导式作用域回归）
+5. 部署三件套存在且语法合法（Dockerfile/compose/手册关键章节），并做交叉一致性检查：
+   COPY 源路径真实存在、503=存活的健康语义两边一致、容器配置白名单齐全
 """
 from __future__ import annotations
 
@@ -130,6 +131,21 @@ def test_loadtest_cli() -> None:
         check("loadtest.py 使用标准库（无第三方依赖）",
               "urllib" in src and "ThreadPoolExecutor" in src)
 
+        # 真跑一轮 worker：打向未监听端口（立即 Connection refused，不依赖外部网络）。
+        # 目的不是测通服务，而是证明 worker 函数真能执行完——曾因推导式变量
+        # 作用域导致 NameError，而 --help 在 worker 之前就退出，永远查不到。
+        for mode, extra in (("chat", ["--concurrency", "2", "--rounds", "1"]),
+                            ("ingest", ["--concurrency", "2",
+                                        "--samples-dir", "data/samples"])):
+            rr = subprocess.run(
+                [sys.executable, str(p), "--base", "http://127.0.0.1:1",
+                 "--mode", mode, *extra],
+                capture_output=True, text=True, timeout=60)
+            out = rr.stdout + rr.stderr
+            check(f"loadtest.py {mode} 模式 worker 可执行（无 NameError/Traceback）",
+                  rr.returncode == 0 and "NameError" not in out
+                  and "Traceback" not in out, out[-400:])
+
 
 def test_deployment_artifacts() -> None:
     print("— 部署配置 —")
@@ -147,6 +163,18 @@ def test_deployment_artifacts() -> None:
         check("Dockerfile 用 python:3.13", "python:3.13" in s)
         check("Dockerfile 含健康检查", "HEALTHCHECK" in s)
         check("Dockerfile 非 root 运行", "appuser" in s or "useradd" in s)
+        # 503 = degraded 也算存活（核心依赖挂但进程活着），语义须显式编码
+        check("Dockerfile 健康检查把 503 视为存活", "503" in s)
+        # COPY 的构建上下文源路径必须真实存在——曾 COPY uv.lock 但仓库里没有
+        # （.gitignore 忽略它），导致 docker build 直接失败
+        for line in s.splitlines():
+            line = line.strip()
+            if not line.upper().startswith("COPY ") or "--from=" in line:
+                continue            # --from= 是跨阶段拷贝，源在 builder 镜像里
+            for src in line.split()[1:-1]:
+                if any(ch in src for ch in "*?["):
+                    continue        # 通配符无法静态判定
+                check(f"Dockerfile COPY 源存在：{src}", (root / src).exists())
 
     if dc.exists():
         s = dc.read_text(encoding="utf-8")
@@ -154,6 +182,13 @@ def test_deployment_artifacts() -> None:
               "redis" in s and "app:" in s)
         check("compose 挂载 data 持久化", "/app/data" in s)
         check("compose 含 REDIS_URL 指向容器服务", "redis://redis:6379" in s)
+        # 健康检查语义须与 Dockerfile 一致：503 不算死
+        check("compose 健康检查把 503 视为存活", "503" in s)
+        # 容器 environment 是白名单：安全/限额相关变量漏登记 → 容器内永远用默认值
+        # （曾漏 ALLOWED_ORIGINS / MAX_UPLOAD_MB / API_MAX_INFLIGHT / INGEST_WORKERS）
+        for key in ("DASHSCOPE_API_KEY", "SERVICE_API_KEY", "ALLOWED_ORIGINS",
+                    "MAX_UPLOAD_MB", "API_MAX_INFLIGHT", "INGEST_WORKERS"):
+            check(f"compose 透传 {key}", key in s)
 
     if dm.exists():
         s = dm.read_text(encoding="utf-8")

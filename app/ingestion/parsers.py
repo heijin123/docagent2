@@ -343,14 +343,23 @@ def _collect_table(lines: list[str], i: int):
 
 
 def _read_text(path: Path) -> str:
-    """编码探测：utf-8 → gbk → utf-8 replace。"""
+    """编码探测：utf-8 → gbk → utf-8 replace；换行统一为 \\n（CRLF/CR → LF）。
+
+    换行归一化是必要的：下游 `_parse_txt` 按 "\\n\\n" 切段落，Windows 编辑器产出的
+    纯文本是 "\\r\\n\\r\\n"，不归一化会导致**整份文件被当成一个段落**；且残留的 "\\r"
+    是 C0 控制符，还会触发 `_looks_garbled` 误报"疑似乱码"。
+    """
     raw = path.read_bytes()
+    text: str | None = None
     for enc in ("utf-8", "gbk"):
         try:
-            return raw.decode(enc)
+            text = raw.decode(enc)
+            break
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")
+    if text is None:
+        text = raw.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _looks_garbled(text: str) -> bool:
