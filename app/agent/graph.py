@@ -1,20 +1,24 @@
 """LangGraph 图组装（F3 编排 + F4.1 checkpointer）+ 对话运行入口。
 
+职责边界（重要）：本图**只做检索与披露，不发起任何升级 / 转交动作**——没有 handoff 节点，
+不建工单、不转接人工、不指定责任人。"找谁办"一律以文本形式告知，由客户自行联系。
+
 图：START → ingest ─┬─ chitchat(rule) → direct_reply ─┐
-                    ├─ human_handoff(rule) → handoff ─┤
-                    └─ 其余 → rewrite → retrieve → answer(合并意图) ─┬─ chitchat → finalize
-                                                                     ├─ human_handoff → handoff
-                                                                     ├─ confirm(仅过期) → finalize
-                                                                     └─ verify ─┬─ ok → finalize
-                                                                                ├─ retry → rewrite（回环）
-                                                                                └─ handoff → handoff
-分支全部走条件边（F3.8）：意图路由、过期确认分支、置信度/重试上限判定都是确定性代码。
-supervisor 的意图分类已合并进 answer 节点（同一次 LLM 调用产出 intent + answer），明确寒暄/
-转人工仍由 rule_classify_intent 规则短路（零 LLM）。
+                    ├─ contact(rule)  → direct_reply ─┤  （要求转人工 → 只给"该找谁"指引话术）
+                    └─ 其余 → rewrite → retrieve ─┬─ 检索为空 → no_data ────────┐
+                                                  └─ 有结果 → answer(合并意图) ─┬─ chitchat/contact → finalize
+                                                                                ├─ confirm(仅过期) → finalize
+                                                                                └─ verify ─┬─ ok → finalize
+                                                                                           ├─ retry → rewrite（回环）
+                                                                                           └─ 超限 → disclose → finalize
+分支全部走条件边（F3.8）：入口意图路由、空检索短路、过期确认分支、置信度/重试上限判定都是
+确定性代码。意图分类已合并进 answer 节点（同一次 LLM 调用产出 intent + answer），明确寒暄 /
+要求转人工仍由 rule_classify_intent 规则短路（零 LLM）。
 """
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterator
 from typing import Literal
 
@@ -66,73 +70,88 @@ def build_qa_graph(
     g.add_node("ingest", nodes.ingest)
     g.add_node("rewrite", nodes.rewrite)
     g.add_node("retrieve", nodes.retrieve)
+    g.add_node("no_data", nodes.no_data)
     g.add_node("answer", nodes.answer)
     g.add_node("verify", nodes.verify)
     g.add_node("retry", nodes.retry)
+    g.add_node("disclose", nodes.disclose)
     g.add_node("direct_reply", nodes.direct_reply)
-    g.add_node("handoff", nodes.handoff)
     g.add_node("finalize", nodes.finalize)
 
     g.add_edge(START, "ingest")
 
-    def _entry_route(state: AgentState) -> Literal["direct_reply", "handoff", "rewrite"]:
-        # 合并 supervisor 的确定性短路：明确寒暄/转人工直接路由（零 LLM）；
-        # 其余（含歧义）进 rewrite→retrieve→answer，由 answer 节点在同一次调用里产出 intent。
+    def _entry_route(state: AgentState) -> Literal["direct_reply", "rewrite"]:
+        # 确定性短路：明确寒暄 / 要求转人工直接路由（零 LLM，且都不检索）。
+        # 注意 contact_guidance 只让 direct_reply 输出"该找谁"的指引话术，
+        # 系统本身不转交、不建单；其余（含歧义）进 rewrite→retrieve→answer。
         ri = prompts.rule_classify_intent(state.get("query", ""))
-        if ri == "chitchat":
+        if ri in ("chitchat", "contact_guidance"):
             return "direct_reply"
-        if ri == "human_handoff":
-            return "handoff"
         return "rewrite"
 
     g.add_conditional_edges(
         "ingest", _entry_route,
-        {"direct_reply": "direct_reply", "handoff": "handoff", "rewrite": "rewrite"},
+        {"direct_reply": "direct_reply", "rewrite": "rewrite"},
     )
 
     g.add_edge("rewrite", "retrieve")
-    g.add_edge("retrieve", "answer")
 
-    def _route_after_answer(state: AgentState) -> Literal["chitchat", "handoff", "confirm", "verify"]:
-        # answer 节点已合并产出 intent；据其路由（F2.8 仅过期确认 → 不 verify 直接 finalize）
+    def _route_after_retrieve(state: AgentState) -> Literal["no_data", "answer"]:
+        # 确定性短路（成本关键）：现行 + 过期都没命中 → 直接走"无资料"披露，**0 次 LLM**。
+        # 旧设计此时会白烧 answer + verify 两轮再转人工；现在既省钱，也不把知识库的
+        # 覆盖缺口甩成人工负担。
+        if state.get("confirmation_needed"):
+            return "answer"          # F2.8 仅命中过期 → 先走确认话术
+        if not state.get("retrieved"):
+            return "no_data"
+        return "answer"
+
+    g.add_conditional_edges("retrieve", _route_after_retrieve,
+                            {"no_data": "no_data", "answer": "answer"})
+
+    def _route_after_answer(state: AgentState) -> Literal["direct", "confirm", "verify"]:
+        # answer 节点产出 intent；据其路由（F2.8 仅过期确认 → 不 verify 直接 finalize）
         intent = state.get("intent", "kb_qa")
-        if intent == "chitchat":
-            return "chitchat"
-        if intent == "human_handoff":
-            return "handoff"
+        if intent in ("chitchat", "contact_guidance"):
+            return "direct"
         return "confirm" if state.get("confirmation_needed") else "verify"
 
     g.add_conditional_edges(
         "answer", _route_after_answer,
-        {"chitchat": "finalize", "handoff": "handoff",
-         "confirm": "finalize", "verify": "verify"},
+        {"direct": "finalize", "confirm": "finalize", "verify": "verify"},
     )
 
-    def _route_after_verify(state: AgentState) -> Literal["ok", "retry", "handoff"]:
-        # F3.6/F3.8：确定性判定——置信度/grounded 达标即完成；未达标且未超上限→重试；超限→转人工
+    def _route_after_verify(state: AgentState) -> Literal["ok", "retry", "disclose"]:
+        # F3.6/F3.8：确定性判定——置信度/grounded 达标即完成；未达标且未超上限→重试；
+        # 超限→disclose（保留答案 + 确定性披露后缀），**不再**转人工。
         grounded = bool(state.get("grounded"))
         confidence = float(state.get("confidence", 0.0))
         if grounded and confidence >= threshold:
             return "ok"
         if state.get("retry_count", 0) < retry_max:
             return "retry"
-        return "handoff"
+        return "disclose"
 
     g.add_conditional_edges("verify", _route_after_verify,
-                            {"ok": "finalize", "retry": "retry", "handoff": "handoff"})
+                            {"ok": "finalize", "retry": "retry", "disclose": "disclose"})
 
     g.add_edge("retry", "rewrite")           # 回环：rewrite（带重试 hint）→ retrieve → answer → verify
+    g.add_edge("no_data", "finalize")
+    g.add_edge("disclose", "finalize")
     g.add_edge("direct_reply", "finalize")
-    g.add_edge("handoff", "finalize")
     g.add_edge("finalize", END)
 
     graph = g.compile(checkpointer=checkpointer)
     return graph, note
 
 
-def thread_config(thread_id: str) -> dict:
-    """checkpointer key 维度（F4.1）：thread_id 由调用方按 {tenant}:{user} 传入。"""
-    return {"configurable": {"thread_id": thread_id}}
+def thread_config(thread_id: str, request_id: str = "") -> dict:
+    """checkpointer key 维度（F4.1）：thread_id 由调用方按 {tenant}:{user} 传入。
+
+    request_id 一并放进 configurable，供节点落 kb_gap 等离线线索日志时携带
+    （可空，不参与 checkpointer 的 thread 定位）。
+    """
+    return {"configurable": {"thread_id": thread_id, "request_id": request_id}}
 
 
 class AgentApp:
@@ -156,21 +175,37 @@ class AgentApp:
             logger.warning("checkpointer 降级: %s", note)
         self._ckpt_degraded = degraded
         self.last_usage = TokenUsage()  # 最近一轮 reply 的链路 token 用量
+        self.last_calls = 0             # 最近一轮 reply 的真实 LLM 调用次数（-1 = 重试轮数）
+        self.last_retries = 0           # 最近一轮 reply 的 verify 重试次数（0 = 一次过）
+        self.last_verified = False      # 最近一轮 reply 是否**真正执行了 verify 节点**
 
     def reply(self, query: str, thread_id: str, *,
               include_expired: bool = False) -> AssistantReply:
+        t0 = time.time()
         before = self.llm.meter.snapshot()
+        calls_before = self.llm.meter.calls
         state = self.graph.invoke(
             {"query": query, "include_expired": include_expired},
             thread_config(thread_id),
         )
         self.last_usage = self.llm.meter.snapshot() - before
+        self.last_calls = self.llm.meter.calls - calls_before
+        # verify 重试次数直接读终态：retry_count 由 retry 节点自增（ingest 每轮重置为 0），
+        # 因此它精确等于"这一问被 verify 打回几次"，是重试成本的一手证据（不靠日志文本推断）。
+        self.last_retries = int(state.get("retry_count", 0))
+        # 是否经过 verify：**只认终态留下的痕迹**，不靠"LLM 调用次数"反推。
+        # 反例（曾真实发生）：rewrite 规则短路后正常题只有 2 跳（answer+verify），
+        # 而按 `llm_calls >= 3` 猜的旧判据会把它们全判成"未经过 verify"。
+        self.last_verified = any(str(x).startswith("verify") for x in state.get("notes", []))
         return AssistantReply(
             answer=state.get("answer", ""),
             citations=[Citation(**c) for c in state.get("citations", [])],
             confidence=float(state.get("confidence", 0.0)),
             degraded=bool(state.get("degraded")),
             intent=str(state.get("intent", "kb_qa")),
+            # 契约 §2.1 声明 AssistantReply 含 latency_ms；非流式路径此前恒为 0（仅 SSE 路径填），
+            # 这里补齐——评估/调用方按 latency_ms 统计单问耗时才对得上流式通道的口径。
+            latency_ms=int((time.time() - t0) * 1000),
             notes=list(state.get("notes", [])),
             usage=self.last_usage.to_dict(),
         )
@@ -187,7 +222,6 @@ class AgentApp:
         """
         import queue
         import threading
-        import time
 
         sink_q: queue.Queue = queue.Queue()  # ("token", str)
         graph, _note = build_qa_graph(
@@ -199,11 +233,16 @@ class AgentApp:
         def _run() -> None:
             try:
                 before = self.llm.meter.snapshot()
+                calls_before = self.llm.meter.calls
                 state = graph.invoke(
                     {"query": query, "include_expired": include_expired},
-                    thread_config(thread_id),
+                    thread_config(thread_id, request_id),
                 )
                 self.last_usage = self.llm.meter.snapshot() - before
+                self.last_calls = self.llm.meter.calls - calls_before
+                self.last_retries = int(state.get("retry_count", 0))
+                self.last_verified = any(str(x).startswith("verify")
+                                         for x in state.get("notes", []))
                 sink_q.put(("state", state))
             except Exception as exc:  # noqa: BLE001 — SSE 通道内错误走 error 事件
                 logger.exception("stream 图执行异常 thread=%s", thread_id)
@@ -240,8 +279,9 @@ class AgentApp:
                         notes=list(state.get("notes", [])),
                         usage=self.last_usage.to_dict(),
                     )
-                    # 非 LLM 直答路径（chitchat/handoff/资料不足拒答）无 token 事件 →
-                    # done 前补发整段，保证"token 拼接 == done.answer"（前端零特判）。
+                    # 非 LLM 直答路径（chitchat / contact_guidance / no_data / 确认话术）
+                    # 无 token 事件 → done 前补发整段，保证"token 拼接 == done.answer"
+                    # （前端零特判）。disclose 的披露后缀在节点内经 token_sink 实时补发。
                     if not sent_tokens and reply.answer:
                         yield {"type": "token", "data": {"content": reply.answer}}
                     for c in citations:

@@ -67,6 +67,21 @@ class Settings:
     # 重试交由业务层可控退避，避免「为成功率无视价格」地偷偷重发整段 prompt。
     llm_max_retries: int = field(default_factory=lambda: _env_int("LLM_MAX_RETRIES", 0))
 
+    # ── 输出约束 / 思考模式（2026-09-14 实测后新增）────────────
+    # answer 生成长度上限（**只约束可见正文**，不含 reasoning token，见下）。
+    # 实证（24 条评估）：answer 不限长时单问 completion 达 2388 token，
+    # 单次调用最长 3184 token / 78.6s —— completion 长度就是延迟的第一驱动，
+    # 而链路延迟 P95 已超 NFR 17 倍。512 足够容纳"结论 + 3~5 句 + [来源:] 标记"的 JSON 包体。
+    # 注意：设得过小会让 JSON 被截断（finish_reason=length → 解析失败 → 白重试一次），
+    # 所以不是越小越好；512 是"够装下完整 JSON 信封"的安全值。
+    answer_max_tokens: int = field(default_factory=lambda: _env_int("ANSWER_MAX_TOKENS", 512))
+    # 是否让模型走「思考（reasoning）」模式。qwen3.8-flash **默认开思考**，实测
+    # 单次回答 reasoning 占 314~877 token（用户看不见、却按输出价计费，且串行生成直接
+    # 变慢）。实测关闭后同题 completion 由 1069 → 193 token（≈5.5×），JSON 仍合法。
+    # 置 1 可改回开思考（若发现答案质量下降，优先只给 verify 开）。
+    llm_enable_thinking: bool = field(
+        default_factory=lambda: _env_bool("LLM_ENABLE_THINKING", False))
+
     # ── LLM 定价（估算基线，CNY / 1K tokens，输入/输出）─────────
     # 以 DashScope 官网最新价格为准；此处仅作成本可见化的估算基线。
     # 价格随模型迭代变动频繁，请定期核对 https://help.aliyun.com/zh/model-studio/models

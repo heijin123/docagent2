@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from typing import Literal, TypedDict
 
-Intent = Literal["kb_qa", "chitchat", "human_handoff"]
+# 全量状态意图：kb_qa / chitchat / contact_guidance。
+# contact_guidance = 用户要求转人工 / 问该找谁 → 只产出"该联系谁"的指引话术
+# （规则短路，零 LLM）；系统不代为转交、不建工单、不指定责任人。
+Intent = Literal["kb_qa", "chitchat", "contact_guidance"]
 
 
 class AgentState(TypedDict, total=False):

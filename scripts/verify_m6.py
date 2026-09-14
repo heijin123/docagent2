@@ -157,6 +157,7 @@ def test_cli_eval() -> None:
                        capture_output=True, text=True, timeout=60)
     check("app.cli eval --help 退出码 0", r.returncode == 0, r.stderr[:200])
     check("eval 帮助含 --answers/--top-k", "--answers" in r.stdout and "--top-k" in r.stdout)
+    check("eval 帮助含 --limit（分层抽样）", "--limit" in r.stdout)
 
 
 def main() -> int:

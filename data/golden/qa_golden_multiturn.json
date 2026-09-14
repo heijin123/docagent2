@@ -1,0 +1,73 @@
+{
+  "meta": {
+    "schema": "1.1-multiturn",
+    "description": "多轮对话评估集（step 0）：先复现历史轮（真跑 LLM），再评估末轮。用于验证 ① 多轮 history 注入的真实 token 代价；② should_skip_rewrite 在该跳时是否跳掉（分类行为）；③ 多轮下末轮引用是否可回查。",
+    "created": "2026-09-14",
+    "tenant_id": "tenant_demo",
+    "case_count": 5,
+    "note": "**与单轮集分开存放**：多轮末轮多为指代/省略句（如「那二线城市呢？」），原始 query 本身不含可检索内容，若并入单轮集用原始 query 算 recall@5 会因口径错误而暴跌——检索层指标必须用**改写后**的 effective query 计算。字段：turns（用户轮列表，末轮为被评估对象）、category（anaphora 指代 / ellipsis 省略 / independent 独立新问题）、expected_doc / anchor（锚句，定位期望块）。assistant 轮不入 golden——它由真实链路生成（这正是多轮测试的意义）。",
+    "category_legend": {
+      "anaphora": "指代：末轮含「它/这个/那个」等指代词 → should_skip_rewrite 词表应命中 → 必须 rewrite",
+      "ellipsis": "省略：末轮靠上文补全主题。细分为「带指代词」与「无指代词」两种——后者（m002「部门经理的标准是多少？」）才是纯词表判据的真正反例，也是放宽 should_skip_rewrite 后最该防的回归点",
+      "independent": "独立新问题：与上文主题无关 → 应跳过 rewrite（省一跳），同时也是「history 成本」的净测量样本（跳过后 hop 数与首轮相同）"
+    },
+    "known_limitation": "5 条仅为链路验证样本，不足以外推多轮指标的统计结论；类别分布刻意偏向难例（3 条需补全 / 1 条省略 / 1 条独立），不代表线上真实比例。"
+  },
+  "cases": [
+    {
+      "id": "m001",
+      "category": "anaphora",
+      "turns": [
+        "差旅住宿标准是多少？",
+        "这个标准是什么时候开始执行的？"
+      ],
+      "expected_doc": "policy_travel_expense_v2_2026-01-01.md",
+      "anchor": "本制度自 2026 年 1 月 1 日起执行",
+      "note": "「这个标准」指代上轮主题（差旅住宿标准）；同上轮答案须携带 2026 修订版信息，才能消解到正确文档"
+    },
+    {
+      "id": "m002",
+      "category": "ellipsis",
+      "turns": [
+        "出差住酒店一天最多能报多少钱？",
+        "部门经理的标准是多少？"
+      ],
+      "expected_doc": "policy_travel_expense_v2_2026-01-01.md",
+      "anchor": "部门经理 | 一线城市 | 1100/天",
+      "note": "**无指代词的省略**（首版误用「那二线城市呢？」，其实命中 _PRONOMINAL_HINTS 的『那』没测到东西，故改为本句）：末轮 11 字、不含任何指代词，主题（住宿）+ 对象（部门经理）全靠上文补全 → 词表必漏，是「纯词表判据」的真正反例。同时考版本：v1 部门经理为 700/天、v2 为 1100/天，必须取现行版"
+    },
+    {
+      "id": "m003",
+      "category": "independent",
+      "turns": [
+        "差旅住宿标准是多少？",
+        "园区停车月卡多少钱？"
+      ],
+      "expected_doc": "misc_parking_guide.md",
+      "anchor": "员工月卡 150 元",
+      "note": "末轮是完整独立问题（无指代、无省略）→ 应跳过 rewrite。跳过后 hop 数与首轮一致，因此「末轮 prompt − 首轮 prompt」= 纯 history 注入成本（受控对照）"
+    },
+    {
+      "id": "m004",
+      "category": "anaphora",
+      "turns": [
+        "年假可以跨年累计多少天？",
+        "那它没用完的部分怎么处理？"
+      ],
+      "expected_doc": "hr_annual_leave_2026.md",
+      "anchor": "折算标准为日工资的 200%",
+      "note": "「它」指代年假；末轮追问的是同文档另一节（未休折算），考指代消解的定向性——错解开成「跨年累计」就会答错条目"
+    },
+    {
+      "id": "m005",
+      "category": "ellipsis",
+      "turns": [
+        "差旅报销的住宿上限是多少？",
+        "那市内交通补贴呢？"
+      ],
+      "expected_doc": "policy_travel_expense_v2_2026-01-01.md",
+      "anchor": "每人每天 120 元",
+      "note": "省略 + 版本时效双重检验：v1 为 80/天、v2 为 120/天。若 rewrite 错误地沿用「住宿」主题或落到 v1 已废止条款，此处即暴露"
+    }
+  ]
+}

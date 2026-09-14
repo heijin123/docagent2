@@ -14,8 +14,16 @@ services:
       QWEN_EMBEDDING_MODEL: ${QWEN_EMBEDDING_MODEL:-text-embedding-v3}
       EMBED_DIMENSIONS: ${EMBED_DIMENSIONS:-1024}
       QWEN_LLM_MODEL: ${QWEN_LLM_MODEL:-qwen-plus}
+      # LLM 输出约束 / 思考模式 / 超时：**必须在白名单登记**，否则容器内只能用应用默认值
+      # （此前 HTTP_READ_TIMEOUT_S / LLM_MAX_RETRIES 就漏登记 → 代码里的默认值在 compose 下改不动）
+      ANSWER_MAX_TOKENS: ${ANSWER_MAX_TOKENS:-512}
+      LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-0}
+      HTTP_READ_TIMEOUT_S: ${HTTP_READ_TIMEOUT_S:-120}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-0}
       SERVICE_API_KEY: ${SERVICE_API_KEY:-}
       DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-tenant_demo}
+      # 主题锚点词表路径（留空 = 用默认 ./data/kb_anchors.json）
+      KB_ANCHORS_PATH: ${KB_ANCHORS_PATH:-}
       # 服务限额（M4）：白名单式注入——新增配置项需在此登记，否则容器内用默认值
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}

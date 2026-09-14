@@ -43,7 +43,11 @@ curl http://localhost:8000/api/v1/health
 |---|---|---|
 | `DASHSCOPE_API_KEY` | 空 | 必填；空则 embedding/LLM 双降级 mock（仅链路回归，无语义） |
 | `QWEN_EMBEDDING_MODEL` | text-embedding-v3 | 向量模型（需与 `EMBED_DIMENSIONS` 一致） |
-| `QWEN_LLM_MODEL` | qwen-plus | 对话模型 |
+| `QWEN_LLM_MODEL` | qwen-plus | 对话模型（**id 全小写**，大小写错会 404 model_not_found） |
+| `ANSWER_MAX_TOKENS` | 512 | answer 正文长度上限（只约束可见正文，不含 reasoning）。调小可省 token/延迟，但**太大会白花钱、太小小会截断 JSON**（截断→解析失败→白重试一次，日志有 `输出被 max_tokens 截断` 告警） |
+| `LLM_ENABLE_THINKING` | 0 | 是否开思考模式。qwen3.8-flash **默认开思考**，实测单题 reasoning 占 314~877 token（用户看不见但按输出价计费、还串行拖慢）；关闭后同题 completion 1069→193 token |
+| `HTTP_READ_TIMEOUT_S` | 120 | LLM 读取超时；配合 `LLM_MAX_RETRIES=0` 杜绝 SDK 静默重发整段 prompt |
+| `LLM_MAX_RETRIES` | 0 | LLM 客户端重试次数；**保持 0**，重试由业务层可控退避接管 |
 | `SERVICE_API_KEY` | 空 | **生产必填**；启用 `Authorization: Bearer <key>` 鉴权 |
 | `REDIS_URL` | redis://localhost:6379/0 | checkpointer 地址 |
 | `REDIS_CHECKPOINTER_ENABLED` | 1 | 1=用 Redis 跨会话；0=强制内存 |
@@ -79,10 +83,16 @@ curl http://localhost:8000/api/v1/health
 | 维度 | 建议 | 原因 |
 |---|---|---|
 | 副本数 | 水平扩容（多副本 + 共享 Redis） | 单进程多 worker 会各自打开 Chroma 连接，存在并发写风险 |
-| 数据目录 | `./data` 挂卷持久化 | 向量库/BM25/registry.db/uploads/日志 |
+| 数据目录 | `./data` 挂卷持久化 | 向量库/BM25/registry.db/uploads/日志/锚点词表 |
 | Redis | AOF 持久化 + 定期备份 | checkpoint 是跨会话记忆唯一持久层 |
 | 入库并发 | `INGEST_WORKERS=1` | 单写者串行，避免 Chroma 写冲突 |
 | 问答并发 | `API_MAX_INFLIGHT` 对齐 LLM 配额 | 每请求多轮 LLM 往返，需控在途量防雪崩 |
+
+**锚点词表（`data/kb_anchors.json`）**：`rewrite` 短路判据用的主题词，由 `ingest`
+完成后自动重建（`app/cli.py::_rebuild_anchors`），也可手动跑
+`scripts/build_anchor_vocab.py`。它是从 BM25 语料派生的，**语料变更后不重建就会过期**；
+过期只会让判据退化成"一律改写"（不影响正确性，只多一次 LLM 往返），且词表缺失/损坏
+时自动退化为同一行为，不会中断问答。路径可用 `KB_ANCHORS_PATH` 覆盖。
 
 **水平扩容注意**：Chroma 的 `data/chroma_db` 是本地目录，多副本共享同一挂卷会冲突。
 若需多副本，二选一：
@@ -99,12 +109,16 @@ curl http://localhost:8000/api/v1/health
   - `llm_call`：LLM 往返 >3000ms（含 node、model、prompt_chars、tokens）
   - `ingest_slow`：入库 >5000ms（含 doc_id、chunks、status）
   - `http_request`：每请求耗时 + 状态码（INFO 级，req_id 贯穿）
+- **业务事件**（INFO 级，不受慢阈值限制，每次必记，供成本/内容运营聚合）：
+  - `llm_usage`：每次 LLM 调用的 token 与预估成本（node/model/prompt_tokens/completion_tokens/est_cost_cny）
+  - `kb_gap`：**检索完全无命中**时记录的覆盖缺口线索（req_id/thread_id/query/rewritten_query/expired_candidates）；**仅供离线聚类"缺失主题"**，不进任何人工作队列、不触发工单
 - **阈值可调**：`OBS_SLOW_QUERY_MS` / `OBS_SLOW_LLM_MS` / `OBS_SLOW_INGEST_MS`。
 
 接入采集（任选）：
 - Loki + Promtail：直接吞 JSON 行日志；
 - Filebeat → ELK：同目录采集；
-- 自建告警：`jq 'select(.event=="slow_query")' data/logs/agent.log`。
+- 自建告警：`jq 'select(.event=="slow_query")' data/logs/agent.log`；
+- 知识库缺口盘点（离线、非告警）：`jq -r 'select(.event=="kb_gap") | .query' data/logs/agent.log | sort | uniq -c | sort -rn` —— 把"查不到的问题"聚成缺失主题清单，交管理员决定补哪几篇。
 
 ---
 
@@ -130,7 +144,7 @@ curl http://localhost:8000/api/v1/health
 - 单请求端到端 SSE（真实 DashScope，合并前 qwen3.8-max）：约 16.8s（3 次 LLM 往返 supervisor+answer+verify，NFR P95≤8s 未达标）；现合并意图进 answer + 换 Qwen3.8-Flash 后 kb_qa 仅 2 次往返，延迟预期显著下降，待重新压测确认（见 §7）。
 - mock 模式下主要瓶颈在 Chroma 查询与 BM25 分词，QPS 取决于本机 CPU。
 
-> 压测前确认服务已灌入语料，否则 `chat` 会大量命中"资料不足→转人工"分支，延迟不代表真实负载。
+> 压测前确认服务已灌入语料，否则 `chat` 会大量命中"检索为空 → no_data"分支（0 次 LLM，延迟虚低），不代表真实负载。
 
 ---
 

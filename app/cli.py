@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from app.ingestion.pipeline import IngestPipeline, run_ingest
 from app.retrieval.embedding import build_embedder
@@ -69,10 +70,35 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
     ok = sum(1 for r in reports if r["status"] == "ok")
     print(f"\n共 {len(reports)} 个文件，成功 {ok}，失败 {len(reports) - ok}")
+
     provider = reports[0]["provider"] if reports else "?"
     degraded = any(r["degraded"] for r in reports)
-    print(f"Embedding provider={provider}{'（degraded: 无 Key 降级 mock，无语义仅链路）' if degraded else ''}")
+    print(f"Embedding provider={provider}"
+          f"{'（degraded: 无 Key 降级 mock，无语义仅链路）' if degraded else ''}")
+
+    _rebuild_anchors()
     return 0 if ok == len(reports) else 1
+
+
+def _rebuild_anchors() -> None:
+    """摄取完成后重建主题锚点词表（供 rewrite 短路判据用）。
+
+    词表是从 BM25 语料派生的话题词，**语料一变就可能过期**；过期只会让判据
+    退化成"一律改写"（不劣化正确性），但会白烧一跳，所以这里自动跟上。
+    任何失败都不影响 ingest 结果——只提示。
+    """
+    from app.agent import anchors
+    from app.core.config import settings
+
+    try:
+        meta = anchors.build_vocab(
+            Path(settings.bm25_dir) / "corpus.db",
+            Path(__file__).resolve().parents[1] / "data" / "kb_anchors.json",
+        )
+        print(f"锚点词表已重建：{meta['counts']['union']} 个词 "
+              f"（docs={meta['docs']}）")
+    except Exception as exc:  # noqa: BLE001 — 不影响摄取结果
+        print(f"⚠ 锚点词表重建失败（rewrite 短路会退化为一律改写）：{exc}")
 
 
 def cmd_eval(args: argparse.Namespace) -> int:
@@ -98,12 +124,16 @@ def cmd_eval(args: argparse.Namespace) -> int:
     report, path = run_eval(
         retriever, bm25_store, agent=agent,
         golden_path=args.golden, with_answers=args.answers,
-        top_k=args.top_k)
+        top_k=args.top_k, limit=args.limit)
 
-    print(f"\n===== 评估报告（provider={report['meta']['provider']}"
-          f"{'，degraded' if report['meta']['degraded'] else ''}）=====")
+    m = report["meta"]
+    print(f"\n===== 评估报告（provider={m['provider']}"
+          f"{'，degraded' if m['degraded'] else ''}）=====")
+    if m["cases_used"] != m["cases_total"]:
+        print(f"题集: 分层抽样 {m['cases_used']}/{m['cases_total']} 条"
+              f"（limit={m['limit']}，按 type 轮询；分组 {m['by_type']}）")
     r = report["retrieval"]
-    if report["meta"]["degraded"]:
+    if m["degraded"]:
         print(f"检索层: recall@5/MRR SKIP（mock 向量无语义，仅链路回归）")
         print(f"  锚句定位: {len(r['per_case'])} 条待定位（mock 下不评估）")
     else:
@@ -120,6 +150,16 @@ def cmd_eval(args: argparse.Namespace) -> int:
               f"(prompt {c['total_prompt_tokens']} / completion {c['total_completion_tokens']}) "
               f"| 预估 ¥{c['est_cost_cny']:.4f} "
               f"| 单问均 {c['avg_tokens_per_query']} token")
+    if report.get("latency"):
+        lt = report["latency"]
+        print(f"延迟: 单问全链路 p50 = {lt['p50_ms']}ms | p95 = {lt['p95_ms']}ms "
+              f"| mean = {lt['mean_ms']}ms | max = {lt['max_ms']}ms（{lt['samples']} 条）")
+    if report.get("verify"):
+        v = report["verify"]
+        print(f"校验: verify 首过 {v['first_pass']}/{v['reached_verify']} "
+              f"= {v['first_pass_rate']:.3f} | 重试 {v['retried']} 条 "
+              f"| 判定 {v['judgements']} 次（单问均 {v['avg_judgements_per_query']}）"
+              f" | max 重试 {v['max_retries']}")
     print(f"门槛: recall@5 ≥ {report['threshold']['recall_at_k']} → "
           f"verdict = {report['verdict']}")
     print(f"报告: {path}")
@@ -146,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
     eval_p.add_argument("--answers", action="store_true",
                         help="额外跑答案层引用可回查率（需真 Key）")
     eval_p.add_argument("--top-k", type=int, default=5, help="recall@k 的 k（默认 5）")
+    eval_p.add_argument("--limit", type=int, default=None,
+                        help="只跑分层抽样的前 N 条（按 type 轮询、每类至少 1 条）；默认跑全集 55 条")
     eval_p.set_defaults(func=cmd_eval)
 
     args = parser.parse_args(argv)

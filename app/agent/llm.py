@@ -1,6 +1,6 @@
 """LLM 客户端抽象（M3）：DashScope(OpenAI 兼容) / stub 降级双通道。
 
-- DashScopeLLM：chat completions + JSON 输出，temp=0（supervisor/verify 确定性）；
+- DashScopeLLM：chat completions + JSON 输出，temp=0（verify 确定性）；
 - StubLLM：无 Key 时降级，规则式产出去驱动图结构与测试（链路回归，无语义），degraded 标注；
 - build_llm()：有 Key → dashscope；无 Key → stub（degraded=True 不掩盖，与 embedding 同哲学）。
 """
@@ -24,7 +24,7 @@ T = TypeVar("T", bound=BaseModel)
 
 _TOKEN_STEP = 12  # stub 分段模拟流式的最小块长
 
-# 合并 supervisor：流式首行 <intent>意图</intent> 标签（意图：kb_qa/chitchat/human_handoff）
+# 合并意图：流式首行 <intent>意图</intent> 标签（意图只允许 kb_qa/chitchat）
 _INTENT_TAG_RE = re.compile(r"<intent>\s*([a-z_]+)\s*</intent>", re.IGNORECASE)
 _MAX_INTENT_PREFIX = 256  # 标签未闭合前的缓冲上限；超界退化为 kb_qa 原样流式
 
@@ -51,8 +51,11 @@ class LLMClient:
         """M4 流式 answer：on_token(str) 逐段回调产出文本，返回最终结构化结果。
 
         引用反解约定：文本流结束后从 [来源: ...] 标记映射回证据 chunk_id
-        （见 _parse_chunk_ids_from_answer）；映射为空时 chunk_ids=[]，由
-        verify/条件边自然兜底（grounded=False → 重试或转人工），不在此处编造。
+        （见 _parse_chunk_ids_from_answer）；映射为空时 chunk_ids=[]，交由
+        verify/条件边自然兜底（grounded=False → 重试或披露），不在此处编造。
+
+        流式不变式：on_token 推送的块的拼接**恒等于**返回的 answer，
+        前端零特判即可还原答案（见 DashScopeLLM.stream_answer 的 _emit）。
         """
         raise NotImplementedError
 
@@ -84,6 +87,7 @@ class DashScopeLLM(LLMClient):
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
+                    extra_body=_thinking_extra_body(),
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
@@ -105,6 +109,9 @@ class DashScopeLLM(LLMClient):
             if usage is not None:
                 log_llm_usage("", node="complete_json", model=self.model, usage=usage,
                               est_cost_cny=usage.cost(*settings.llm_price(self.model)))
+            # 限长副作用可见化：被 max_tokens 截断 → JSON 必坏 → 白重试一次（双倍成本）。
+            # 不静默：留 WARN 便于按日志调 answer_max_tokens。
+            _warn_if_truncated(resp, node="complete_json", max_tokens=max_tokens)
             try:
                 return _parse_json_strict(schema, resp.choices[0].message.content or "")
             except Exception as exc:  # noqa: BLE001
@@ -127,8 +134,10 @@ class DashScopeLLM(LLMClient):
         resp = self._client.chat.completions.create(
             model=self.model,
             temperature=0.2,
-            max_tokens=1500,
+            # 与 answer 节点同口径的限长：流式正文同样不许无限长（原硬编码 1500 且模型常无视）
+            max_tokens=settings.answer_max_tokens,
             stream=True,
+            extra_body=_thinking_extra_body(),
             stream_options={"include_usage": True},  # 让尾块带回真实 usage
             messages=[
                 {"role": "system", "content": system},
@@ -138,14 +147,36 @@ class DashScopeLLM(LLMClient):
         chunks: list[str] = []
         usage: TokenUsage | None = None
         intent = ""
+        finish_reason = ""
         intent_resolved = False
-        prefix = ""  # 标签闭合前的缓冲（未闭合时不推送，避免把标签推给前端）
+        prefix = ""      # 标签闭合前的缓冲（未闭合时不推送，避免把标签推给前端）
+        started = False  # 是否已推送过内容（用于剥掉正文前导空白，保持拼接一致）
+
+        def _emit(piece: str) -> None:
+            """推送一块正文：首块剥掉前导空白，其余原样推送。
+
+            这样 "".join(推送块) == 最终 answer 恒成立——SSE 端"token 拼接 ==
+            done.answer"的不变式由构造保证，前端零特判。"""
+            nonlocal started
+            if not started:
+                piece = piece.lstrip()
+                if not piece:
+                    return
+                started = True
+            chunks.append(piece)
+            on_token(piece)
+
         for event in resp:
             if getattr(event, "usage", None) is not None:  # 尾块：真实 token 用量
                 usage = TokenUsage.from_openai(event.usage)
                 continue
             if not event.choices:
                 continue
+            # getattr 兜底：finish_reason 只出现在最后一个 chunk，且测试用的 Fake 流式
+            # choice 未必实现该字段——不能假设它一定存在（否则整条 SSE 直接 error 事件）。
+            _fr = getattr(event.choices[0], "finish_reason", None)
+            if _fr:
+                finish_reason = _fr
             delta = event.choices[0].delta
             piece = (delta or {}).content
             if not piece:
@@ -158,17 +189,14 @@ class DashScopeLLM(LLMClient):
                     after = prefix[m.end():]
                     intent_resolved = True
                     if after:
-                        chunks.append(after)
-                        on_token(after)
+                        _emit(after)
                 elif len(prefix) > _MAX_INTENT_PREFIX:
                     # 模型未遵循首行 <intent> 格式 → 放弃解析，原样流式（默认 kb_qa）
                     intent_resolved = True
-                    chunks.append(prefix)
-                    on_token(prefix)
+                    _emit(prefix)
                 # else: 仍在缓冲标签，暂不推送
             else:
-                chunks.append(piece)
-                on_token(piece)
+                _emit(piece)
         if usage is not None:  # 流式也纳入整条链路计量
             self.meter.add(usage)
             self.last_usage = usage
@@ -181,9 +209,17 @@ class DashScopeLLM(LLMClient):
         if usage is not None:
             log_llm_usage("", node="stream_answer", model=self.model, usage=usage,
                           est_cost_cny=usage.cost(*settings.llm_price(self.model)))
-        text = "".join(chunks).strip()
-        text = _INTENT_TAG_RE.sub("", text).strip()  # 兜底清除残留标签
-        if not text:
+        if finish_reason == "length":
+            # 流式被截断 = 前端看到的正文本身就是半截话（无 JSON 解析问题，但观感更差）
+            logger.warning(
+                "stream_answer 正文被 max_tokens=%s 截断（completion=%s）→ 用户会看到半截回答；"
+                "请上调 ANSWER_MAX_TOKENS 或收紧 prompt 长度要求",
+                settings.answer_max_tokens, usage.completion_tokens if usage else "?")
+        # 刻意**不再**对 text 做 strip / 标签正则替换：任何后处理都会让 answer 与已推送的
+        # token 不一致（破坏拼接不变式）。标签已在流式解析阶段被消费（不进 chunks），
+        # 正文前导空白由 _emit 剥掉，故此处只需原样 join。
+        text = "".join(chunks)
+        if not text.strip():
             return schemas.AnswerOutput(answer="", chunk_ids=[], intent=intent or "kb_qa")
         evidence = _extract_tag(user, "evidence")
         chunk_ids = _parse_chunk_ids_from_answer(text, evidence)
@@ -240,11 +276,11 @@ class StubLLM(LLMClient):
         return schemas.RewriteOutput(rewritten_query=q, changed=False)
 
     def answer_rule(self, user: str) -> schemas.AnswerOutput:
-        # 合并 supervisor：自判意图（兜底规则；真实模型由 prompt 产出 intent）
+        # 自判意图（兜底规则；真实模型由 prompt 产出 intent）。
+        # 只产出 kb_qa / chitchat —— "要求转人工"由 prompts.rule_classify_intent 规则
+        # 短路处理，不进 LLM 决策（系统不决定找谁，也不代办转交）。
         q = _extract_tag(user, "query")
-        if any(k in q for k in ("转人工", "人工客服", "找客服", "human", "投诉")):
-            intent = "human_handoff"
-        elif len(q.strip()) <= 12 and any(
+        if len(q.strip()) <= 12 and any(
                 k in q.lower() for k in ("你好", "hi", "hello", "在吗", "谢谢", "再见", "拜拜", "早上好", "晚上好", "嗨")):
             intent = "chitchat"
         else:
@@ -262,8 +298,9 @@ class StubLLM(LLMClient):
             if len(picks) >= 2:
                 break
         if not picks:
+            # 无证据可引：如实说明缺失，不提"转人工"（是否找他人由用户自己决定）
             return schemas.AnswerOutput(
-                answer="知识库暂无相关现行资料，建议转人工核实。", chunk_ids=[], intent=intent)
+                answer="知识库现有资料不足以回答该问题。", chunk_ids=[], intent=intent)
         cites = _citations_text(evidence, picks)
         body = "根据检索到的资料：" + cites + "（如需进一步细节请说明）。"
         return schemas.AnswerOutput(answer=body, chunk_ids=picks, intent=intent)
@@ -359,6 +396,33 @@ def _parse_json_strict(schema: type[T], raw: str) -> T:
             text = m.group(0)
     parsed = json.loads(text)
     return schema.model_validate(parsed)
+
+
+def _thinking_extra_body() -> dict:
+    """思考模式开关（DashScope 扩展参数 `enable_thinking`）。
+
+    qwen3.8-flash **默认开思考**：实测同一道题 reasoning 占 314~877 token，用户看不见
+    却按输出价计费，且 token 是串行生成的 → 直接变成延迟。关闭后同题 completion
+    1069 → 193 token（≈5.5×）、JSON 仍合法（见 2026-09-14 探测）。
+    由 `settings.llm_enable_thinking` 统一控制（默认 False），不提供逐节点参数以保持调用面稳定。
+    """
+    return {"enable_thinking": bool(settings.llm_enable_thinking)}
+
+
+def _warn_if_truncated(resp, *, node: str, max_tokens: int) -> None:
+    """max_tokens 截断告警：截断会让 JSON 解析失败并触发一次白重试（成本翻倍）。"""
+    try:
+        finish = resp.choices[0].finish_reason
+    except Exception:  # noqa: BLE001 — 结构异常不影响主流程
+        return
+    if finish == "length":
+        usage = _usage_from_resp(resp)
+        logger.warning(
+            "%s 输出被 max_tokens=%s 截断（completion=%s）→ JSON 极可能不合法，"
+            "将白重试一次；请上调 %s",
+            node, max_tokens,
+            usage.completion_tokens if usage else "?",
+            "ANSWER_MAX_TOKENS" if node in ("complete_json", "stream_answer") else "max_tokens")
 
 
 def _usage_from_resp(resp) -> "TokenUsage | None":

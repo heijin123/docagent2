@@ -15,7 +15,8 @@
   2. token 流中绝不含 <intent> 标签（标签被剥离，不污染前端）；
   3. done.intent 正确（kb_qa）；
   4. token 拼接 == done.answer（前端零特判即可还原答案）；
-  5. chitchat 规则短路（零 LLM）→ 仍走 SSE 且 intent=chitchat。
+  5. chitchat 规则短路（零 LLM）→ 仍走 SSE 且 intent=chitchat；
+  6. 要求转人工（contact_guidance）→ 规则短路仍走 SSE，只给联系指引（不转交、不降级）。
 用法: python scripts/verify_sse_streaming.py
 """
 from __future__ import annotations
@@ -108,6 +109,46 @@ class FakeStreamLLM(DashScopeLLM):
             chat=types.SimpleNamespace(completions=FakeCompletions()))
 
 
+class FakeCompletionsNoUsage:
+    """流式迭代器故意不返回 usage 尾块 —— 复现 DashScope 未回 usage 时 usage=None 的真实场景。"""
+
+    def create(self, *, model, messages, stream=False, **kw):
+        if stream:
+            # 首块带 <intent> 标签、正文，但**没有 usage 尾块**
+            return iter([_Event(content="<intent>kb_qa</intent>答案正文。")])
+        return _Resp('{"grounded": true, "confidence": 0.9, "reason": "ok"}')
+
+
+class FakeStreamLLMNoUsage(FakeStreamLLM):
+    """底层 client 用 FakeCompletionsNoUsage，触发 stream_answer 中 usage 保持 None 的分支。"""
+
+    def __init__(self):
+        super().__init__()
+        self._client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=FakeCompletionsNoUsage()))
+
+
+def check_stream_no_usage_path() -> None:
+    """验收：流式尾块缺失 usage（usage=None）时，stream_answer 不抛 AttributeError。
+
+    直接对应代码评审报告「L170-188 当 usage 为 None 时访问属性」——
+    当前 181 行 `if usage is not None:` 已守卫 182-183，本测试锁定该兜底。
+    """
+    print("── 3. 流式尾块无 usage（usage=None）不抛 AttributeError ──")
+    app = AgentApp(FakeRetriever(), FakeStreamLLMNoUsage(), memory_checkpoint=True)
+    try:
+        events = list(app.stream_events("怎么报销", "sse:nousage", request_id="r3"))
+    except AttributeError as e:
+        check("usage=None 时不抛 AttributeError", False, f"AttributeError: {e}")
+        return
+    t3 = [e["type"] for e in events]
+    done3 = [e for e in events if e["type"] == "done"][0]["data"]
+    check("尾块无 usage 仍产出 done（无 AttributeError）", "done" in t3, str(t3))
+    check("answer 正文完整（=答案正文。）", done3["answer"] == "答案正文。", done3["answer"])
+    check("intent 兜底为 kb_qa", done3.get("intent") == "kb_qa", str(done3.get("intent")))
+    check("done 不含 degraded（正常出答案）", done3.get("degraded") is False)
+
+
 class _RetrievalResult:
     items = [{
         "chunk_id": "doc_kq_0001_00003",
@@ -161,6 +202,22 @@ def main() -> int:
     check("chitchat intent=chitchat（规则短路）", done2.get("intent") == "chitchat",
           str(done2.get("intent")))
     check("chitchat 非 degraded", done2.get("degraded") is False)
+
+    print("── 3. contact_guidance（要求转人工）仍走 SSE 且只给指引 ──")
+    ev_c = list(app.stream_events("我要转人工客服", "sse:contact", request_id="r4c"))
+    t_c = [e["type"] for e in ev_c]
+    done_c = [e for e in ev_c if e["type"] == "done"][0]["data"]
+    check("contact 也产出 done", "done" in t_c, str(t_c))
+    check("contact intent=contact_guidance", done_c.get("intent") == "contact_guidance",
+          str(done_c.get("intent")))
+    check("contact 只给联系指引、不降级",
+          "不具备转接" in done_c["answer"] and done_c.get("degraded") is False,
+          done_c["answer"][:60])
+    tok_c = "".join(e["data"]["content"] for e in ev_c if e["type"] == "token")
+    check("contact token 拼接 == done.answer", tok_c == done_c["answer"],
+          f"tok={tok_c[:40]!r} ans={done_c['answer'][:40]!r}")
+
+    check_stream_no_usage_path()
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")
     return 1 if FAIL else 0

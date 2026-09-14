@@ -94,20 +94,32 @@ class TokenUsage:
 
 
 class TokenMeter:
-    """累计 token 用量：挂在 LLM 实例上，随每次调用累加；reply 前/后差值 = 单轮成本。"""
+    """累计 token 用量：挂在 LLM 实例上，随每次调用累加；reply 前/后差值 = 单轮成本。
+
+    同时计数**真实 LLM 调用次数**：重试/多轮节点会让一次 reply 触发多次调用，
+    「调用次数」是比 token 更直观的链路成本信号（重试轮数 = 调用数 - 1）。
+    """
 
     def __init__(self) -> None:
         self._u = TokenUsage()
+        self._calls = 0
 
     def add(self, usage: TokenUsage) -> None:
         if usage is not None:
             self._u = self._u + usage
+        self._calls += 1
 
     def snapshot(self) -> TokenUsage:
         return TokenUsage(**self._u.to_dict())
 
+    @property
+    def calls(self) -> int:
+        """启动至今累计的真实 LLM 调用次数。"""
+        return self._calls
+
     def reset(self) -> None:
         self._u = TokenUsage()
+        self._calls = 0
 
 
 @dataclass
@@ -211,3 +223,29 @@ def log_ingest(req_id: str, duration_ms: float, *, doc_id: str = "",
     _emit_slow(event="ingest_slow", duration_ms=duration_ms,
                threshold_ms=_SLOW_INGEST_MS, req_id=req_id, doc_id=doc_id,
                chunks=chunks, status=status)
+
+
+def log_kb_gap(req_id: str, query: str, *, rewritten_query: str = "",
+               thread_id: str = "", expired_candidates: int = 0) -> None:
+    """知识库覆盖缺口线索（event=kb_gap）：检索完全无命中时记录，**每次必记**。
+
+    定位（重要，别当成告警）：这只是一条**离线线索**——供知识库管理员把散落的
+    "查不到的问题"聚类成「Top-N 缺失主题」，再决定补哪几篇文档。它
+    **不进入任何人工作队列、不触发工单、不做任何转交/升级动作**（对齐系统职责边界：
+    本系统只做检索与披露，"补资料"是客户/管理员侧的职能）。
+
+    与 log_llm_usage 同为不设阈值的结构化 JSON 行（level=INFO），字段固定
+    （ts/event/req_id/thread_id/query/rewritten_query/expired_candidates），
+    生产可由 Loki/Filebeat 按 `event=kb_gap` 聚合出缺口主题排行。
+    """
+    payload = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "level": "INFO",
+        "event": "kb_gap",
+        "req_id": req_id,
+        "thread_id": thread_id,
+        "query": (query or "")[:200],
+        "rewritten_query": (rewritten_query or "")[:200],
+        "expired_candidates": expired_candidates,
+    }
+    logger.info(json.dumps(payload, ensure_ascii=False))

@@ -77,7 +77,13 @@ def compute_answer_metrics(
         ok += 1 if verifiable else 0
         per_case[case.id] = {"status": "ok" if verifiable else "unverifiable",
                              "verifiable": verifiable,
-                             "citations": sorted(cites)}
+                             "citations": sorted(cites),
+                             # 逐题成本/延迟一并留档：此前只有聚合值，做归因时得手工对齐日志
+                             "latency_ms": ans.get("latency_ms"),
+                             "llm_calls": ans.get("llm_calls"),
+                             "retries": ans.get("retries"),
+                             "verified": ans.get("verified"),
+                             "total_tokens": (ans.get("usage") or {}).get("total_tokens")}
     rate = ok / verified if verified else 0.0
     return {"verifiable_rate": rate, "verified": verified, "skipped": skipped,
             "per_case": per_case}

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from typing import Iterable
 
+from app.agent import anchors
+
 
 def _dumps(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
@@ -44,43 +46,85 @@ def render_history(messages: list[dict], max_rounds: int = 10) -> str:
 
 
 # ── F3.8 确定性路由短路（性能优化：明确场景不进 LLM）────────────
-_HANDOFF_KW = ("转人工", "人工客服", "找客服", "投诉", "人工", "客服")
+# 客户要求"转人工 / 找客服 / 投诉"→ 只产出"该找谁"的指引话术（不代办、不承诺转接）。
+_CONTACT_KW = ("转人工", "人工客服", "找客服", "投诉", "人工", "客服")
 _CHITCHAT_KW = ("你好", "您好", "hi", "hello", "在吗", "谢谢", "再见", "拜拜", "早上好", "晚上好", "嗨")
 # 指代词 / 省略：需结合历史才能理解 → 必须走 rewrite（否则可透传）
 _PRONOMINAL_HINTS = ("它", "他", "她", "这个", "那个", "这", "那", "其", "上述", "前面", "刚才", "再", "也")
 
 
 def rule_classify_intent(query: str) -> str | None:
-    """确定性意图分类：明确命中寒暄/转人工关键词时返回 intent，否则 None（走 LLM）。
+    """确定性意图分类：明确命中寒暄 / 要求转人工关键词时返回 intent，否则 None（走 LLM）。
 
     只做高置信短路（降低误判风险）；kb_qa 恒返回 None 交 LLM 保证准确。
+    返回 contact_guidance 的含义是"用户要人 → 由系统给'该找谁'的指引话术"，
+    **不是**系统去转交人工（系统不发起任何转交动作）。
     """
     q = (query or "").strip()
     if not q:
         return "chitchat"
-    if any(k in q for k in _HANDOFF_KW):
-        return "human_handoff"
+    if any(k in q for k in _CONTACT_KW):
+        return "contact_guidance"
     if len(q) <= 12 and any(k in q.lower() for k in _CHITCHAT_KW):
         return "chitchat"
     return None
 
 
-def should_skip_rewrite(query: str, history: str, retry_count: int) -> bool:
-    """确定性判断：是否可跳过 rewrite 直接透传（省一次 LLM）。
+_MIN_SELF_CONTAINED_LEN = 8
 
-    可跳过条件（全满足）：
-    - 非重试轮（重试需注入"补充引用"hint 改写）；
-    - 无历史上下文（无指代可消解）；
-    - query 不含指代词 / 省略标记（本身已完整可独立检索）。
+
+def _has_generic_head_after_de(q: str) -> bool:
+    """是否为「…的 + 通用中心词」结构（如"部门经理的标准"）。
+
+    这类句子的主题由「的」前的修饰语决定（"部门经理"只是角色，不是知识库主题），
+    单独拎出来无法判断是哪个标准 → 不算自足。
+    """
+    return any("的" + h in q for h in anchors.GENERIC_HEADS)
+
+
+def _is_self_contained(query: str) -> bool:
+    """本句是否**明确不需要改写**：能独自读懂、且自带检索抓手。
+
+    四条同时成立才算自足（任一不满足 → 视为需要上下文的消解）：
+    1. 无回指（它/这个/那… 没有前文无从消解）；
+    2. 非极短句（≤ 8 字信息量不足）；
+    3. 非「…的 + 通用中心词」结构（主题落在修饰语上，而修饰语常是角色/实体）；
+    4. 含主题锚点（词表由语料自动生成，见 app/agent/anchors.py）。
+    """
+    q = (query or "").strip()
+    if not q:
+        return False
+    if any(h in q for h in _PRONOMINAL_HINTS):
+        return False
+    if len(q) <= _MIN_SELF_CONTAINED_LEN:
+        return False
+    if _has_generic_head_after_de(q):
+        return False
+    return anchors.has_topic_anchor(q)
+
+
+def should_skip_rewrite(query: str, history: str, retry_count: int) -> bool:
+    """确定性判断：是否可跳过 rewrite 直接透传（省一次 LLM 往返）。
+
+    **白名单哲学**（2026-09-14 定案）：rewrite 的价值是消解本句对上下文的依赖，
+    而实际场景里大多数问题都需要改写；判错方向也不对称——多改只浪费一跳，
+    漏消解却会直接让检索拿到一句读不懂的话。所以**默认改写**，只在本句被
+    证明「自足」（`_is_self_contained`）时才跳过：
+
+    - 非重试轮（重试必须注入"补充引用"hint 改写）→ 改写；
+    - 本句自足 → **跳过**（与有没有历史无关；旧实现是"有历史就必改写"，会把
+      完全独立的新问题也拖进一次空转改写）；
+    - 本句不自足 + 有历史 → 改写（有东西可消解）；
+    - 本句不自足 + 无历史 → **跳过**（没有可消解的对象，硬改只会让模型编个主题）。
     """
     if retry_count > 0:
-        return False
-    if history and history.strip():
         return False
     q = (query or "").strip()
     if not q:
         return False
-    return not any(h in q for h in _PRONOMINAL_HINTS)
+    if _is_self_contained(q):
+        return True
+    return not (history and history.strip())
 
 
 # ── F3.2 rewrite（含 F2.8 过期确认的自然语言放行）──────────────
@@ -111,31 +155,31 @@ def rewrite_prompt(query: str, history: str, note: str = "") -> tuple[str, str]:
     return system, user
 
 
-# ── F3.4 answer（含 F3.9 过期约束 / 资料不足直说 / 合并 supervisor 意图）────
+# ── F3.4 answer（含 F3.9 过期约束 / 资料不足直说 / 合并意图）────
 def answer_prompt(query: str, evidence: str, history: str,
                   include_expired: bool = False, retry_hint: str = "") -> tuple[str, str]:
     rule = [
-        "回答约束：",
-        "1. 只依据证据回答，禁止编造；证据不足就明说“知识库现有资料不足以回答”，并建议补充或转人工；",
-        "2. 引用证据时必须内嵌引用标记，格式为：[来源: 文档标题 第 N 页]（与证据行的标题/页码一致）；",
-        "3. 证据行带 expired 标记的内容属于过期文档：引用时须在该引用位置后紧跟失效提示"
-        "“⚠ 该信息来自已于 X 过期的文档，仅供追溯”，不能把过期内容当现行规则回答；",
-        "4. 回答现行政策/流程类问题时，若全部证据均 expired → 明确提示请以现行制度为准；",
+        "约束：",
+        "1. 只依据证据作答，禁止编造。证据不足即明说“知识库现有资料不足以回答”并指出缺什么；"
+        "不要建议转人工或联系客服（要不要找他人由用户自己决定）。",
+        "2. 先给结论，正文 ≤3 句（合计 ≤200 字）。不复述问题、不成段抄录证据原文、"
+        "不写“综上所述/总的来说”等套话；有例外情形只在结论后补 1 句。",
+        "3. 每个论断后内嵌引用：[来源: 文档标题 第 N 页]，须与证据行的标题/页码一致。",
+        "4. 证据行带 expired 标记者属过期文档：引用处须紧跟“⚠ 该信息来自已于 X 过期的文档，"
+        "仅供追溯”，不得当现行规则回答；若全部证据均 expired → 提示请以现行制度为准。",
         "5. chunk_ids 只能填证据行 [cN] 中出现的 chunk_id。",
     ]
     intent_rule = (
-        "先判断意图 intent（取 kb_qa / chitchat / human_handoff）：\n"
-        "- 若只是寒暄/问候/感谢（如“你好”“谢谢”）→ intent=chitchat，answer 给一句简短友好的问候，chunk_ids=[]；\n"
-        "- 若用户明确要求转人工/找客服/投诉 → intent=human_handoff，answer 给转接话术，chunk_ids=[]；\n"
-        "- 其余依赖知识库的问题 → intent=kb_qa，按上述约束从证据回答。"
+        "先判 intent（只允许 kb_qa / chitchat）：寒暄/问候/感谢（如“你好”“谢谢”）→ chitchat，"
+        "answer 给一句简短问候、chunk_ids=[]；其余依赖知识库的问题 → kb_qa，按上述约束作答。"
     )
     if include_expired:
-        rule.append("6. 用户已确认可查看过期文档，但过期引用仍须遵守第 3/4 条失效提示。")
-    system = ("你是企业知识库问答助手。输出 JSON：intent（意图）、answer（最终回答文本）、"
-              "chunk_ids（本次回答引用的证据 chunk_id 列表）。\n"
-              + intent_rule + "\n" + "\n".join(rule) + "\n输出示例：" +
+        rule.append("6. 用户已确认可查看过期文档；过期引用仍须遵守第 4 条。")
+    system = ("你是企业知识库问答助手。输出 JSON：intent、answer（回答文本）、"
+              "chunk_ids（引用的证据 chunk_id 列表）。\n"
+              + intent_rule + "\n" + "\n".join(rule) + "\n示例：" +
               _dumps({"intent": "kb_qa",
-                      "answer": "根据《考勤管理制度》……（含 [来源: ...] 标记）",
+                      "answer": "……[来源: 文档标题 第 1 页]",
                       "chunk_ids": ["doc_xxx_0001_00002"]}))
     user = (
         "历史对话（语境参考）：\n" + history + "\n\n"
@@ -155,25 +199,25 @@ def answer_stream_prompt(query: str, evidence: str, history: str,
     chunk_ids 再逐字产出，改为"文本流式产出 → 结束后从 [来源: ...] 反解 chunk_ids"
     （_parse_chunk_ids_from_answer），token 事件即最终答案本身。
 
-    合并 supervisor：首行必须以 <intent>意图</intent> 开头（意图取 kb_qa / chitchat /
-    human_handoff），紧接着输出最终回答正文；流式回调在首行命中即解析意图用于路由、
-    剥离标签后把正文照常 token 流式推送，既合并意图分类又保留 SSE 流式。
+    合并意图：首行必须以 <intent>意图</intent> 开头（意图只允许 kb_qa / chitchat），
+    紧接着输出最终回答正文；流式回调在首行命中即解析意图用于路由、剥离标签后把正文
+    照常 token 流式推送，既合并意图分类又保留 SSE 流式。
     """
     rule = [
         "输出要求：",
-        "1. 第一行必须以 <intent>意图</intent> 开头（意图取 kb_qa / chitchat / human_handoff），"
-        "紧接着输出最终回答正文，不要输出 JSON 或任何包裹格式；",
-        "2. 只依据证据回答，禁止编造；证据不足就明说“知识库现有资料不足以回答”，并建议补充或转人工；",
-        "3. 引用证据时必须内嵌引用标记，格式为：[来源: 文档标题 第 N 页]（与证据行的标题/页码一致），"
-        "可多次引用不同文档；",
-        "4. 证据行带 expired 标记的内容属于过期文档：引用时须在该引用位置后紧跟失效提示"
-        "“⚠ 该信息来自已于 X 过期的文档，仅供追溯”，不能把过期内容当现行规则回答；",
-        "5. 回答现行政策/流程类问题时，若全部证据均 expired → 明确提示请以现行制度为准；",
-        "6. 意图判断：寒暄/问候/感谢 → intent=chitchat（正文给简短问候）；明确要求转人工/找客服/投诉 → "
-        "intent=human_handoff（正文给转接话术）；其余依赖知识库的问题 → intent=kb_qa（从证据回答并内嵌 [来源:]）。",
+        "1. 第一行必须是 <intent>意图</intent>（只允许 kb_qa / chitchat），紧接着输出回答正文；"
+        "不要输出 JSON 或任何包裹格式。",
+        "2. 只依据证据作答，禁止编造。证据不足即明说“知识库现有资料不足以回答”并指出缺什么；"
+        "不要建议转人工或联系客服（要不要找他人由用户自己决定）。",
+        "3. 先给结论，正文 ≤3 句（合计 ≤200 字）。不复述问题、不成段抄录证据原文、"
+        "不写“综上所述/总的来说”等套话；有例外情形只在结论后补 1 句。",
+        "4. 每个论断后内嵌引用：[来源: 文档标题 第 N 页]，须与证据行的标题/页码一致；可引用多篇。",
+        "5. 证据行带 expired 标记者属过期文档：引用处须紧跟“⚠ 该信息来自已于 X 过期的文档，"
+        "仅供追溯”，不得当现行规则回答；若全部证据均 expired → 提示请以现行制度为准。",
+        "6. 寒暄/问候/感谢 → intent=chitchat（正文一句问候）；其余依赖知识库的问题 → intent=kb_qa。",
     ]
     if include_expired:
-        rule.append("7. 用户已确认可查看过期文档，但过期引用仍须遵守第 4/5 条失效提示。")
+        rule.append("7. 用户已确认可查看过期文档；过期引用仍须遵守第 5 条。")
     system = "你是企业知识库问答助手。\n" + "\n".join(rule)
     user = (
         "历史对话（语境参考）：\n" + history + "\n\n"
@@ -185,18 +229,19 @@ def answer_stream_prompt(query: str, evidence: str, history: str,
 
 
 # ── F3.5 verify（独立评估，不给思维链；F3.9 置信度规则在节点代码）──
+# 注意：evidence 由 verify 节点按「答案实际引用的 chunk」收窄后传入（未被引用的候选
+# 对判定无贡献，曾占本跳 prompt 的 84%）；零引用时才回退全量。
 def verify_prompt(query: str, answer: str, evidence: str) -> tuple[str, str]:
     system = (
-        "你是回答质量校验器。只做判定，不修改答案。判定两项：\n"
-        "1. grounded：答案核心论断是否被给定证据支撑（含引用标记是否对应真实证据行）；\n"
-        "2. confidence：0-1 综合置信度（覆盖度、一致性、引用真实性）。\n"
-        "reason 最多一句话（≤20 字），不要展开分析。\n"
-        "输出 JSON。输出示例："
+        "你是回答质量校验器。只判定，不改答案：\n"
+        "1. grounded：答案核心论断是否被给定证据支撑，引用标记是否对应真实证据行；\n"
+        "2. confidence：0-1 置信度（覆盖度、一致性、引用真实性）。\n"
+        "reason ≤20 字，不展开。输出 JSON，示例："
         + _dumps({"grounded": True, "confidence": 0.85, "reason": "要点均有引用"})
     )
     user = (
-        "用户问题：<query>" + query + "</query>\n\n"
-        "待校验答案（不做修改）：<answer>" + answer + "</answer>\n\n"
-        "可引用证据：\n<evidence>\n" + evidence + "\n</evidence>"
+        "问题：<query>" + query + "</query>\n\n"
+        "答案：<answer>" + answer + "</answer>\n\n"
+        "相关证据：\n<evidence>\n" + evidence + "\n</evidence>"
     )
     return system, user

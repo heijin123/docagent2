@@ -14,7 +14,7 @@
 ### 1.1 编码与命名
 
 - HTTP 协议，请求/响应体一律 `application/json; charset=utf-8`（上传除外）
-- 字段命名统一 **snake_case**；枚举值统一 **小写下划线**（如 `kb_qa`、`human_handoff`）
+- 字段命名统一 **snake_case**；枚举值统一 **小写下划线**（如 `kb_qa`、`contact_guidance`）
 - 时间戳统一 **Unix 秒（int）**，禁止毫秒/字符串日期混用
 - 空值语义：可选字段用 `null`，不传或传 null 等价；禁止用 `""` 表示空
 - 数值限制：所有数值为 JSON number；禁止 NaN / Infinity；浮点分数仅允许出现在内部调试接口
@@ -124,8 +124,8 @@ SSE 通道内发生错误时 **HTTP 状态保持 200**，通过 `error` 事件�
 | answer | string | 最终答案；含过期引用时**必须**内嵌"⚠ 已于 {时间} 失效"提示 |
 | citations | array | 引用列表；`validity ∈ valid / expired`，expired 必有 `expired_at`；`doc_date` 为文档日期（年份错位自查，F2.9）；`image_ids` 非空时前端按 §2.8 回填原图（F1.10） |
 | confidence | float | 0~1，Verify 节点输出 |
-| degraded | bool | true = 走降级路径（资料不足/转人工/纯过期支撑） |
-| intent | string | `kb_qa / chitchat / human_handoff` |
+| degraded | bool | true = 走降级路径（资料不足 / 仅过期文档支撑 / 校验未达标的披露） |
+| intent | string | `kb_qa / chitchat / contact_guidance`（后两类不检索、零 LLM） |
 | latency_ms | int | 全链路耗时（v1.3 补入模型） |
 | request_id | string | 追踪 ID（v1.3 补入模型） |
 | notes | array | 可选过程说明（年份回退/降级/过期提示等，调试用，v1.3 补入模型） |
@@ -390,19 +390,22 @@ class DocRegistry(Protocol):
 
 ### 4.9 Agent 编排（LangGraph）
 
-节点清单（固定）：`ingest → (chitchat→direct_reply | human_handoff→handoff | 其余→rewrite→retrieve→answer(合并意图)→verify) → finalize` + retry 回环（supervisor 意图分类已合并进 answer 节点）
+节点清单（固定）：`ingest → (chitchat/contact→direct_reply | 其余→rewrite→retrieve ─┬→ no_data └→ answer(合并意图)→verify) → finalize` + retry 回环（意图分类已合并进 answer 节点）
+
+> **职责边界**：本系统只做**检索与披露**，不发起任何升级 / 转交动作——没有转人工节点，
+> 不建工单、不转接人工、不指定责任人。"该找谁"一律以文本形式告知，由客户自行联系。
 
 ```python
 class QAState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     question: str
     rewritten_query: str
-    intent: Literal["kb_qa", "chitchat", "human_handoff"]
+    intent: Literal["kb_qa", "chitchat", "contact_guidance"]
     retrieved: RetrieveOutcome          # 4.5
     answer: str
     citations: list[Citation]
     confidence: float
-    retry_count: int                    # max 2，超限强制 handoff
+    retry_count: int                    # max 2，超限 → disclose（披露局限，不转人工）
     degraded: bool
 
 class AgentResult(BaseModel):           # = done 事件 data（2.1 AssistantReply）
@@ -412,7 +415,8 @@ class AgentResult(BaseModel):           # = done 事件 data（2.1 AssistantRepl
     notes: list[str] | None = None      # 可选过程说明（年份回退/降级/过期提示等，v1.3 补入）
 ```
 
-- 分支逻辑（重试计数、置信度阈值、仅过期命中提示）在**条件边**实现；意图分类已合并进 answer 节点（同一次 LLM 调用产出 intent + answer），verify 只产出 grounded/confidence 判定，LLM 不决定流程走向
+- 分支逻辑（重试计数、置信度阈值、空检索短路、仅过期命中提示）在**条件边**实现；意图分类已合并进 answer 节点（同一次 LLM 调用产出 intent + answer），verify 只产出 grounded/confidence 判定，LLM 不决定流程走向
+- 空检索短路（成本关键）：`retrieved` 为空 → `no_data` 节点如实告知缺失，**0 次 LLM**（旧设计会白烧 answer+verify 两轮再转人工）；同时落一条 `event=kb_gap` 结构化日志（query/rewritten_query/thread_id），**仅作离线线索**供知识库管理员聚类缺失主题，不进任何人工作队列、不触发工单
 - 过期引用约束（F3.9）：citation.validity=expired 时 answer 内必须内嵌失效提示，Verify confidence 下调一档，纯过期支撑 → degraded=true
 
 ---
@@ -421,7 +425,7 @@ class AgentResult(BaseModel):           # = done 事件 data（2.1 AssistantRepl
 
 | 枚举 | 取值 | 用途 |
 |---|---|---|
-| intent | `kb_qa` / `chitchat` / `human_handoff` | QAState / AssistantReply |
+| intent | `kb_qa` / `chitchat` / `contact_guidance` | QAState / AssistantReply |
 | source | `wiki` / `pdf` / `markdown` / `database` / `web` | chunk 元数据 |
 | block_type | `heading` / `paragraph` / `table` / `image` / `code` / `figure_transcript` | Block（解析内部；`figure_transcript` 为 VLM 红页转录块，F1.9） |
 | permission | `public` / `internal` / `secret` | chunk 元数据 / 过滤 |

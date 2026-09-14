@@ -93,3 +93,62 @@ def locate_expected_chunks(cases: list[GoldenCase], bm25_store,
         case.expected_chunk_ids = hits
         case.located = bool(hits)
     return {c.id: c for c in cases}
+
+
+# ── 多轮评估集（step 0：先测再改）──────────────────────────────
+# 与单轮集**分开存放、分开加载**：多轮末轮多是指代/省略句，原始 query 不含可检索
+# 内容，若并进单轮集用原始 query 算 recall@5，会因口径错误而暴跌（不是真实退化）。
+# 因此多轮集的检索指标一律基于**改写后的 effective query**，由评估脚本从 notes 提取。
+@dataclass
+class MultiTurnCase:
+    id: str
+    turns: list[str]          # 用户轮；turns[-1] 为被评估轮，turns[:-1] 为需复现的历史
+    expected_doc: str
+    anchor: str
+    category: str = "anaphora"   # anaphora 指代 / ellipsis 省略 / independent 独立新问题
+    note: str = ""
+    # 运行时填充
+    expected_chunk_ids: list[str] = field(default_factory=list)
+    located: bool = False
+
+    @property
+    def query(self) -> str:
+        """被评估轮（末轮）的原始 query。"""
+        return self.turns[-1]
+
+    @property
+    def history(self) -> list[str]:
+        """需先复现的历史用户轮。"""
+        return self.turns[:-1]
+
+
+def load_multiturn_golden(path: str | Path | None = None
+                          ) -> tuple[list[MultiTurnCase], dict]:
+    """加载 + 校验多轮评估集（校验口径同单轮：缺字段 / 重复 id / 锚句过短即抛错）。"""
+    p = Path(path or (settings.base_dir / "data" / "golden" / "qa_golden_multiturn.json"))
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    meta = raw.get("meta", {})
+    cases_raw = raw.get("cases", [])
+    if not cases_raw:
+        raise ValueError("多轮 golden 集为空（cases=[]）")
+
+    cases: list[MultiTurnCase] = []
+    seen: set[str] = set()
+    for i, c in enumerate(cases_raw):
+        cid = c.get("id", "")
+        turns = [t for t in (c.get("turns") or []) if str(t).strip()]
+        expected_doc = c.get("expected_doc", "")
+        anchor = c.get("anchor", "")
+        if not (cid and turns and expected_doc and anchor):
+            raise ValueError(f"多轮 golden #{i} 缺字段（id/turns/expected_doc/anchor 必填）")
+        if len(turns) < 2:
+            raise ValueError(f"多轮 golden {cid} 至少需 2 轮（turns 长度 {len(turns)}）")
+        if cid in seen:
+            raise ValueError(f"多轮 golden id 重复: {cid}")
+        if len(normalize(anchor)) < MIN_ANCHOR_LEN:
+            raise ValueError(f"多轮 golden {cid} 锚句过短（<{MIN_ANCHOR_LEN} 字）: {anchor!r}")
+        seen.add(cid)
+        cases.append(MultiTurnCase(
+            id=cid, turns=turns, expected_doc=expected_doc, anchor=anchor,
+            category=c.get("category", "anaphora"), note=c.get("note", "")))
+    return cases, meta

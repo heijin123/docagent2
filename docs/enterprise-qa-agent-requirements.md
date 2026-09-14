@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | v1.7 |
+| 文档版本 | v1.8 |
 | 创建日期 | 2026-09-08 |
-| 更新记录 | v1.7（2026-09-12）：**SSE 流式 + supervisor 意图分类合并进 Answer 节点 + 换 Qwen3.8-Flash**——① 删除独立 `supervisor` 节点，意图分类合并进 `answer` 节点（同一次 LLM 调用产出 intent+answer），kb_qa 单问 LLM 往返由 3 次降至 2 次；明确寒暄/转人工由 `rule_classify_intent` 规则短路（零 LLM）；② 模型由 qwen3.8-max 换 `Qwen3.8-Flash`（北京后付费 0.0008/0.0027 CNY·1K，同 token 量约 max 档 4.3%）；③ SSE 流式首行 `<intent>` 标签在流式期间解析用于路由、推前端前剥离；④ 需求文档 F3.1 同步改为「意图分类（已合并进 Answer 节点）」，架构图移除 Supervisor 节点；⑤ 文档同步 README / deployment / api-contract。<br>v1.6（2026-09-12）：**首次在真实 DashScope 向量下跑通完整评估，并修复三处缺陷**——① 评估实测（`qwen3.7-text-embedding-flash` / 1024 维 / 语料 38 文档 105 chunk）：**recall@5=0.855、MRR=0.791**，55 条全评估、0 条锚句未命中，verdict=**pass**；对比同语料 BM25 单路 0.836 / 0.673，RRF 融合净增益 +0.019 / +0.118，证实向量路对 noisy（口语改写 0.000）与 exact（数字编号 0.750）两块短板的补偿价值。② **修复 `ingest --rebuild` 静默清空索引**（P0）：旧实现 `old_version = version if rebuild else version-1`，在 `action=="new"` 时 `old_version` 恰等于刚写入的版本 → 全部新块被自身翻成 `is_valid=false`，检索静默返回空（实测 105 行 is_valid 全 0、55 条锚句 0 命中）；改为「同 hash 也强制 bump 版本重灌，只失效上一版本」（`_decide(force=True)`），`verify_m1.py` 增 4 条回归断言（41→45）。③ **修复 M5 观测阈值失效**：`log_slow_query` / `log_llm_call` / `log_ingest` 原本无条件 `_emit_slow`，低于阈值也记 WARN（实测 26ms < 500ms 仍刷屏 55+ 行），且 `hybrid.retrieve` 中 `TimedSpan.stop()` 与显式调用**重复记两条**；现改为仅 `duration_ms ≥ 阈值` 落日志并统一走单次记录。④ **修复 `.env` 内联注释陷阱**：python-dotenv 只剥离「值非空」时后随注释，`SERVICE_API_KEY=` 后直接跟 `#` 会把注释整段当密钥 → 意外开启鉴权、接口全 401（`verify_m4` 因此失败）；`.env.example` 与手册已改为注释独立成行。<br>v1.5（2026-09-12）：① **评估语料扩充完成**——`data/samples` 由 5 文档 / 11 chunk 扩至 **38 文档 / 105 chunk**，top-5 覆盖率由 45.5% 降至 **4.8%**，recall@5 首次具备区分度；② 新增 `scripts/make_corpus_long.py`（长文档批次，共 20 份，含 HR/财务/IT/售后各域的强干扰文档）、`scripts/corpus_stats.py`（语料规模与切分分布体检）、`scripts/bm25_probe.py`（**无需 API Key** 的 BM25 离线召回探针，输出 recall@k / MRR 并按 golden `type` 分组，弥补主评估只报总分）；③ 修复 PDF 生成缺陷——`insert_font(fontfile=)` 中文字体整包嵌入致单文件 9.7MB，改 `subset_fonts()` 后降至约 30KB；④ BM25 单路下界 recall@5=0.836 / MRR=0.673；⑤ Backlog「语料侧待做」条目结项。——`data/samples` 由 5 文档 / 11 chunk 扩至 **38 文档 / 105 chunk**，top-5 覆盖率由 45.5% 降至 **4.8%**，recall@5 首次具备区分度；② 新增 `scripts/make_corpus_long.py`（长文档批次，共 20 份，含 HR/财务/IT/售后各域的强干扰文档）、`scripts/corpus_stats.py`（语料规模与切分分布体检）、`scripts/bm25_probe.py`（**无需 API Key** 的 BM25 离线召回探针，输出 recall@k / MRR 并按 golden `type` 分组，弥补主评估只报总分）；③ 修复 PDF 生成缺陷——`insert_font(fontfile=)` 中文字体整包嵌入致单文件 9.7MB，改 `subset_fonts()` 后降至约 30KB；④ BM25 单路下界 recall@5=0.836 / MRR=0.673；⑤ Backlog「语料侧待做」条目结项。<br>v1.4（2026-09-12）：① F7.1 golden 集由 13 条扩至 **55 条**（新增「改写稳健」「噪声」两类），并新增 `scripts/verify_golden_anchors.py` 做锚句可定位性体检（55/55）；`verify_m6.py` 的锚句定位断言由「≥80%」收紧为 **100% 零容忍**；② 记录**语料规模局限**（data/samples 仅 11 chunk，recall@5 区分度不足，语料扩充转入 §12 Backlog）；③ §12 Backlog 更新条目状态；④ 同步实现修复：`parsers._read_text` 统一 CRLF/CR → LF（Windows 纯文本不再被当成单一段落，也消除 C0 控制符导致的「疑似乱码」误报）。<br>v1.3（2026-09-10）：同步契约 v1.3 与实现——① §1.3 非目标改为「不做独立前端工程，但附带零构建静态调试客户端 web/（M7）」；② §5 性能 NFR 标注真实基线 16.8s 与优化路径；③ §6.1 SSE 示例 citation 补 doc_date/image_ids；④ 开发计划 §9、验收 §10 补 M7。<br>v1.2（2026-09-09）：吸收 doc-agent 项目已验证的工程实践——新增 F1.9 PDF 质量门与 VLM 转录、F1.10 图片引用链路、F2.9 年份感知召回、F7 评估体系；7.1 元数据扩展（doc_date/doc_year/image_ids）；风险清单与验收标准同步扩充（详见 `docs/doc-agent-absorption.md`） |
+| 更新记录 | v1.8（2026-09-14）：**删除「转人工」出口——系统只做检索与披露**——① 删除 `handoff` 节点与 `_HANDOFF_MSG`（"已为你转接人工客服"是与现实不符的承诺，系统并无人工座席，也不该由本系统转交）；② 意图词表由 3 值收为 `kb_qa` / `chitchat` / `contact_guidance`——"要求转人工"只走规则短路返回"该找谁"的指引话术，LLM 不再拥有该枚举（找谁不由模型决定）；③ `retrieve` 后新增**空检索短路 → `no_data`（0 次 LLM）**：如实告知资料缺失并指向管理员录入，取代旧设计"白烧 answer+verify 两轮再转人工"；④ verify 重试用尽改走 **`disclose`**：保留答案 + 确定性追加"仅供参考、以原文为准"后缀（无 citation 时改用不可采信提示），不再转人工；⑤ 修复流式不变式——`stream_answer` 不再对正文做 `strip` / 标签替换（会破坏"token 拼接 == done.answer"），改为首块 lstrip + 逐块原样推送，`disclose` 后缀经 token_sink 补发；⑥ 重试 hint 由"请补充引用使校验通过"（诱导堆砌/伪造引用）改为"如实说明资料不足与来源，不要编造"；⑦ 回归 m3 25→**34**、sse 12→**16**，m1/m4/m6/token 全绿；⑧ 同步 README / deployment / api-contract 与本文档（架构图、状态图、F3.1/F3.3/F3.6/F3.7 需求行、QAState 枚举）。<br>v1.7（2026-09-12）：**SSE 流式 + supervisor 意图分类合并进 Answer 节点 + 换 Qwen3.8-Flash**——① 删除独立 `supervisor` 节点，意图分类合并进 `answer` 节点（同一次 LLM 调用产出 intent+answer），kb_qa 单问 LLM 往返由 3 次降至 2 次；明确寒暄/转人工由 `rule_classify_intent` 规则短路（零 LLM）；② 模型由 qwen3.8-max 换 `Qwen3.8-Flash`（北京后付费 0.0008/0.0027 CNY·1K，同 token 量约 max 档 4.3%）；③ SSE 流式首行 `<intent>` 标签在流式期间解析用于路由、推前端前剥离；④ 需求文档 F3.1 同步改为「意图分类（已合并进 Answer 节点）」，架构图移除 Supervisor 节点；⑤ 文档同步 README / deployment / api-contract。<br>v1.6（2026-09-12）：**首次在真实 DashScope 向量下跑通完整评估，并修复三处缺陷**——① 评估实测（`qwen3.7-text-embedding-flash` / 1024 维 / 语料 38 文档 105 chunk）：**recall@5=0.855、MRR=0.791**，55 条全评估、0 条锚句未命中，verdict=**pass**；对比同语料 BM25 单路 0.836 / 0.673，RRF 融合净增益 +0.019 / +0.118，证实向量路对 noisy（口语改写 0.000）与 exact（数字编号 0.750）两块短板的补偿价值。② **修复 `ingest --rebuild` 静默清空索引**（P0）：旧实现 `old_version = version if rebuild else version-1`，在 `action=="new"` 时 `old_version` 恰等于刚写入的版本 → 全部新块被自身翻成 `is_valid=false`，检索静默返回空（实测 105 行 is_valid 全 0、55 条锚句 0 命中）；改为「同 hash 也强制 bump 版本重灌，只失效上一版本」（`_decide(force=True)`），`verify_m1.py` 增 4 条回归断言（41→45）。③ **修复 M5 观测阈值失效**：`log_slow_query` / `log_llm_call` / `log_ingest` 原本无条件 `_emit_slow`，低于阈值也记 WARN（实测 26ms < 500ms 仍刷屏 55+ 行），且 `hybrid.retrieve` 中 `TimedSpan.stop()` 与显式调用**重复记两条**；现改为仅 `duration_ms ≥ 阈值` 落日志并统一走单次记录。④ **修复 `.env` 内联注释陷阱**：python-dotenv 只剥离「值非空」时后随注释，`SERVICE_API_KEY=` 后直接跟 `#` 会把注释整段当密钥 → 意外开启鉴权、接口全 401（`verify_m4` 因此失败）；`.env.example` 与手册已改为注释独立成行。<br>v1.5（2026-09-12）：① **评估语料扩充完成**——`data/samples` 由 5 文档 / 11 chunk 扩至 **38 文档 / 105 chunk**，top-5 覆盖率由 45.5% 降至 **4.8%**，recall@5 首次具备区分度；② 新增 `scripts/make_corpus_long.py`（长文档批次，共 20 份，含 HR/财务/IT/售后各域的强干扰文档）、`scripts/corpus_stats.py`（语料规模与切分分布体检）、`scripts/bm25_probe.py`（**无需 API Key** 的 BM25 离线召回探针，输出 recall@k / MRR 并按 golden `type` 分组，弥补主评估只报总分）；③ 修复 PDF 生成缺陷——`insert_font(fontfile=)` 中文字体整包嵌入致单文件 9.7MB，改 `subset_fonts()` 后降至约 30KB；④ BM25 单路下界 recall@5=0.836 / MRR=0.673；⑤ Backlog「语料侧待做」条目结项。——`data/samples` 由 5 文档 / 11 chunk 扩至 **38 文档 / 105 chunk**，top-5 覆盖率由 45.5% 降至 **4.8%**，recall@5 首次具备区分度；② 新增 `scripts/make_corpus_long.py`（长文档批次，共 20 份，含 HR/财务/IT/售后各域的强干扰文档）、`scripts/corpus_stats.py`（语料规模与切分分布体检）、`scripts/bm25_probe.py`（**无需 API Key** 的 BM25 离线召回探针，输出 recall@k / MRR 并按 golden `type` 分组，弥补主评估只报总分）；③ 修复 PDF 生成缺陷——`insert_font(fontfile=)` 中文字体整包嵌入致单文件 9.7MB，改 `subset_fonts()` 后降至约 30KB；④ BM25 单路下界 recall@5=0.836 / MRR=0.673；⑤ Backlog「语料侧待做」条目结项。<br>v1.4（2026-09-12）：① F7.1 golden 集由 13 条扩至 **55 条**（新增「改写稳健」「噪声」两类），并新增 `scripts/verify_golden_anchors.py` 做锚句可定位性体检（55/55）；`verify_m6.py` 的锚句定位断言由「≥80%」收紧为 **100% 零容忍**；② 记录**语料规模局限**（data/samples 仅 11 chunk，recall@5 区分度不足，语料扩充转入 §12 Backlog）；③ §12 Backlog 更新条目状态；④ 同步实现修复：`parsers._read_text` 统一 CRLF/CR → LF（Windows 纯文本不再被当成单一段落，也消除 C0 控制符导致的「疑似乱码」误报）。<br>v1.3（2026-09-10）：同步契约 v1.3 与实现——① §1.3 非目标改为「不做独立前端工程，但附带零构建静态调试客户端 web/（M7）」；② §5 性能 NFR 标注真实基线 16.8s 与优化路径；③ §6.1 SSE 示例 citation 补 doc_date/image_ids；④ 开发计划 §9、验收 §10 补 M7。<br>v1.2（2026-09-09）：吸收 doc-agent 项目已验证的工程实践——新增 F1.9 PDF 质量门与 VLM 转录、F1.10 图片引用链路、F2.9 年份感知召回、F7 评估体系；7.1 元数据扩展（doc_date/doc_year/image_ids）；风险清单与验收标准同步扩充（详见 `docs/doc-agent-absorption.md`） |
 | 项目代号 | Enterprise-QA-Agent |
 | 技术关键词 | RAG / 向量数据库 / BM25 混合索引 / LangGraph 多 Agent / FastAPI / 异步并发 |
 
@@ -21,7 +21,7 @@
 1. **混合索引检索**：向量语义召回 + BM25 关键词召回，RRF 融合排序，兼顾语义理解与精确匹配。
 2. **多 Agent 协作**：基于 LangGraph 实现意图分类（合并进 Answer 节点）、查询改写、检索、生成、自校验的分工流水线。
 3. **生产级 API**：FastAPI 全异步接口，支持 SSE 流式输出、文档异步入库、并发限流。
-4. **可解释、可兜底**：回答附引用来源；低置信度自动降级（拒答/转人工），死循环防护。
+4. **可解释、可兜底**：回答附引用来源；低置信度自动降级（如实告知资料缺失 / 披露局限），死循环防护；**系统只做检索与披露，不发起转人工、建工单、指定责任人等升级动作**。
 
 ### 1.3 非目标（Out of Scope）
 
@@ -69,9 +69,9 @@ flowchart TB
     subgraph Orchestrator[Agent 编排层 - LangGraph]
         Q[QueryRewrite 查询改写]
         R[HybridRetriever 混合检索]
-        A[Answer 节点（含意图分类，合并原 Supervisor）]
+        A[Answer 节点（含意图分类与生成）]
         V[Verify 自校验节点]
-        H[Handoff 降级/转人工]
+        H[NoData / Disclose 披露节点<br/>只告知，不转人工]
     end
 
     subgraph Retrieval[检索层]
@@ -147,7 +147,7 @@ flowchart LR
     E --> F[清洗与标准化]
     F --> G[质量校验]
     G -->|通过| H[输出给 Chunking]
-    G -->|不通过| I[标记 parse_warning<br/>转人工复核]
+    G -->|不通过| I[标记 parse_warning<br/>待复核（系统只标记，不代办）]
 ```
 
 **各格式解析策略**
@@ -347,7 +347,7 @@ class Block(BaseModel):
   │     │
   │     └─ 现行资料不足 → 二级候选：放宽 effective_time 条件
   │            │
-  │            ├─ 无任何候选（含过期）→ 走 F3 降级路径（资料不足/转人工）
+  │            ├─ 无任何候选（含过期）→ 走 F3 降级路径（no_data：如实告知资料缺失，0 LLM，不转人工）
   │            │
   │            └─ 仅命中过期文档 → 不直接生成答案，回复：
   │                  "知识库中该主题的现行资料不足；找到相关文档，
@@ -399,31 +399,32 @@ class Block(BaseModel):
 ```mermaid
 stateDiagram-v2
     [*] --> Ingest
-    Ingest --> DirectReply: intent = chitchat（规则短路，零 LLM）
-    Ingest --> Handoff: intent = human_handoff（规则短路，零 LLM）
+    Ingest --> DirectReply: intent = chitchat / contact_guidance（规则短路，零 LLM）
     Ingest --> QueryRewrite: 其余 → kb_qa
     QueryRewrite --> HybridRetrieve
     HybridRetrieve --> Rerank: 开关开启
     HybridRetrieve --> Generate: 开关关闭
     Rerank --> Generate
+    HybridRetrieve --> NoData: 检索为空（零 LLM）
     Generate --> Verify: 同一次 LLM 调用产出 intent + answer
     Verify --> END_OK: 置信度达标
     Verify --> QueryRewrite: 重试且 retry < max_retry
-    Verify --> Handoff: retry 达到上限 / 置信度仍低
+    Verify --> Disclose: retry 达到上限 / 置信度仍低
     DirectReply --> END_OK
-    Handoff --> END_DEGRADED
+    NoData --> END_DEGRADED
+    Disclose --> END_DEGRADED
 ```
 
 | 编号 | 需求 | 优先级 |
 |---|---|---|
-| F3.1 | **意图分类（已合并进 Answer 节点）**：由 Answer 节点在同一次 LLM 调用中一并产出意图（`kb_qa` / `chitchat` / `human_handoff`，pydantic Literal 枚举，temp=0）；明确寒暄/转人工由 `rule_classify_intent` 规则短路（零 LLM） | P0 |
+| F3.1 | **意图分类（已合并进 Answer 节点）**：由 Answer 节点在同一次 LLM 调用中一并产出意图（`kb_qa` / `chitchat`，pydantic Literal 枚举，temp=0）；明确寒暄 / 要求转人工由 `rule_classify_intent` 规则短路（零 LLM） | P0 |
 | F3.2 | **QueryRewrite 节点**：结合对话历史把指代/省略问题改写为独立查询；无历史时透传 | P0 |
-| F3.3 | **Retrieve 节点**：调用 F2 混合检索 | P0 |
-| F3.4 | **Answer 节点**：基于检索结果生成回答，强制引用格式 `[来源: 文档名 页码]`；prompt 中明确"资料不足就直接说明" | P0 |
+| F3.3 | **Retrieve 节点**：调用 F2 混合检索；**结果为空 → 直接转 NoData（0 次 LLM）** | P0 |
+| F3.4 | **Answer 节点**：基于检索结果生成回答，强制引用格式 `[来源: 文档名 页码]`；prompt 中明确"资料不足就直接说明"且**不建议转人工** | P0 |
 | F3.5 | **Verify 节点**：自校验——答案是否被引用内容支撑、是否覆盖问题要点，输出置信度分数（pydantic 结构化输出） | P0 |
-| F3.6 | **死循环防护**：retry 计数写入 state，max_retry=2，超限强制走 Handoff 降级路径 | P0 |
-| F3.7 | **Handoff 节点**：输出兜底话术 + 建议转人工，标记 `degraded=true` | P0 |
-| F3.8 | 确定性逻辑（重试次数、置信度阈值判断）写在图的条件边里，**不让 LLM 决定流程走向** | P0 |
+| F3.6 | **死循环防护**：retry 计数写入 state，max_retry=2，超限走 Disclose（保留答案 + 披露局限），**不转人工** | P0 |
+| F3.7 | **披露节点（NoData / Disclose）**：NoData 如实告知资料缺失并指向管理员录入；Disclose 保留答案并追加"仅供参考、以原文为准"的后缀。二者均只做文本告知，标记 `degraded=true`，**不发起转交 / 工单** | P0 |
+| F3.8 | 确定性逻辑（重试次数、置信度阈值判断、空检索短路）写在图的条件边里，**不让 LLM 决定流程走向** | P0 |
 | F3.9 | 过期文档引用约束：Answer 引用过期 chunk 必须输出失效提示（见 F2.8 回答约束）；Verify 对含过期引用的答案 confidence 下调一档，纯过期支撑 → degraded=true | P0 |
 
 ### F4 对话记忆
@@ -465,7 +466,7 @@ stateDiagram-v2
 | F7.2 | **检索层指标**：recall@5（至少一个期望块进 top-k 的用例占比）+ MRR；锚句定位失败的缺陷用例不计指标分母 | P0 |
 | F7.3 | **答案层指标**（可选，需真 Key）：逐条跑问答链路，校验**引用可回查率**——`citations.chunk_id` 必须属于检索命中块 | P1 |
 | F7.4 | **门槛判定**：真实向量 recall@5 ≥ 0.8；mock 向量无语义 → 只保链路、指标 SKIP 并标注 degraded | P0 |
-| F7.5 | 报告落盘 `data/reports/eval_report_latest.json`（含 provider / degraded 标注）；CLI 入口 `python -m app.cli eval [--answers]`，与 API 同构 | P0 |
+| F7.5 | 报告落盘 `data/reports/eval_report_latest.json`（含 provider / degraded 标注，以及 `cost`（token/价格）、`latency`（p50/p95）、`verify`（verify 首过率/重试次数）三个聚合块；逐题含 `llm_calls` / `retries` / `verified`）；CLI 入口 `python -m app.cli eval [--answers] [--limit N]`，与 API 同构。**评估 thread 带本次运行盐值**——否则固定 thread + Redis checkpointer 会残留上一轮历史，使 rewrite 规则短路失效、指标随"跑第几次"漂移 | P0 |
 
 **为什么自研而非套 RAGAS**：golden 用锚句定位期望块，机制透明、可调试、无额外依赖；doc-agent 实证 13 条 golden 即可支撑门槛判定与回归（recall@5=1.0 / MRR=0.885 / 可回查率 100%）。本项目起步 13 条（覆盖语义类 / 精确编号类 / 跨年份三类问题），后续扩 50+。**该扩展已完成**：55 条（语义 / 精确编号 / 跨年份 / 改写稳健 / 噪声五类），真实向量实测 **recall@5=0.855 / MRR=0.791**（verdict=pass）；答案层引用可回查率需 `--answers` 走真实 LLM，尚未复测。
 
@@ -641,7 +642,7 @@ class QAState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     question: str                # 原始问题
     rewritten_query: str         # 改写后的独立查询
-    intent: Literal["kb_qa", "chitchat", "human_handoff"]
+    intent: Literal["kb_qa", "chitchat", "contact_guidance"]
     retrieved: RetrieveOutcome   # 混合检索结果（valid_hits / expired_hits 双桶，见 api-contract 4.5）
     answer: str
     citations: list[Citation]
@@ -681,7 +682,7 @@ class VerifyResult(BaseModel):
 |---|---|---|---|
 | M1 | 项目骨架 + 文档解析 + chunking + PDF 质量门（F1.9）+ 双索引写入 | ingestion pipeline 可跑通，索引可查询 | 2~3 天 |
 | M2 | 混合检索：向量召回 + BM25 召回 + 并行 + RRF 融合 | 检索模块 + 单测，给定 query 返回融合结果 | 2 天 |
-| M3 | LangGraph 多 Agent：rewrite / retrieve / answer(合并意图) / verify / handoff + Redis checkpointer | 完整问答图，多轮对话可用 | 3 天 |
+| M3 | LangGraph 多 Agent：rewrite / retrieve / no_data / answer(合并意图) / verify / disclose + Redis checkpointer | 完整问答图，多轮对话可用 | 3 天 |
 | M4 | FastAPI：SSE 流式、文档上传异步任务、限流、异常处理 | 可用 API 服务 | 2 天 |
 | M5 | 压测 + 观测 + 文档 + README | 压测报告、部署说明 | 1~2 天 |
 | M6 | 评估体系（F7）：golden 集 + recall@5/MRR + 引用可回查率 + 门槛判定 | eval CLI + 报告落盘 | 1 天 |
