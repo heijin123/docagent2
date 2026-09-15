@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from typing import Iterable
 
 from app.agent import anchors
+from app.core.config import settings
 
 
 def _dumps(obj) -> str:
@@ -35,22 +37,69 @@ def render_evidence(items: Iterable[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_history(messages: list[dict], max_rounds: int = 10) -> str:
-    """最近若干轮历史（F4.3 窗口在 ingest 已截断，这里仅做文本化）。"""
+def render_history(messages: list[dict], max_rounds: int = 10, *,
+                   per_msg_chars: int | None = None,
+                   total_chars: int | None = None) -> str:
+    """最近若干轮历史的文本化（**带硬预算**，防多轮把 prompt 撑爆）。
+
+    为什么需要预算：历史在链路里被注入**两次**（rewrite 一次、answer 一次），
+    原先"窗口 10 轮 × 每条 300 字"的写法上限是 6,000 字/次 → 最坏约 7,500 tok/问，
+    而单轮评估没有历史、恒为 0，这个上限级风险单轮口径永远测不到。
+
+    两级预算都**从最新往旧**累积：
+    - 每条消息先截到 `per_msg_chars`；
+    - 全量再截到 `total_chars`，超出即停 → **最新一轮必然完整保留**，优先丢最旧
+      （消解指代依赖的是最近上文，丢旧的代价最小）。
+    `max_rounds` 退化为安全网：预算通常先于轮数窗口生效（6,000 字 > 1,200 字）。
+    """
+    per_msg = per_msg_chars if per_msg_chars is not None else settings.history_per_msg_chars
+    total = total_chars if total_chars is not None else settings.history_total_chars
     msgs = [m for m in (messages or []) if m.get("role") in ("user", "assistant")]
     tail = msgs[-(max_rounds * 2):]
-    return "\n".join(
-        f"{'用户' if m['role'] == 'user' else '助手'}: {m.get('content', '')[:300]}"
-        for m in tail
-    )
+
+    picked: list[str] = []
+    used = 0
+    for m in reversed(tail):
+        line = (f"{'用户' if m['role'] == 'user' else '助手'}: "
+                f"{(m.get('content') or '')[:per_msg]}")
+        # `picked` 非空才允许因预算 break → 单条超预算时至少留一条，绝不返回空历史
+        if picked and used + len(line) > total:
+            break
+        picked.append(line)
+        used += len(line) + 1  # +1 计入换行
+    return "\n".join(reversed(picked))
 
 
 # ── F3.8 确定性路由短路（性能优化：明确场景不进 LLM）────────────
 # 客户要求"转人工 / 找客服 / 投诉"→ 只产出"该找谁"的指引话术（不代办、不承诺转接）。
 _CONTACT_KW = ("转人工", "人工客服", "找客服", "投诉", "人工", "客服")
 _CHITCHAT_KW = ("你好", "您好", "hi", "hello", "在吗", "谢谢", "再见", "拜拜", "早上好", "晚上好", "嗨")
-# 指代词 / 省略：需结合历史才能理解 → 必须走 rewrite（否则可透传）
-_PRONOMINAL_HINTS = ("它", "他", "她", "这个", "那个", "这", "那", "其", "上述", "前面", "刚才", "再", "也")
+# 回指（指代）判定：需结合历史才能消解 → 必须改写。
+# ⚠ 单字代词必须**按分词整词**匹配，不能按子串：否则「这周」「那次」「其他」这类复合词
+# 会被误判成回指——2026-09-15 由 m007 实测抓出（「员工食堂这周的菜单是什么？」是完整独立
+# 问题，却因含「这」被判需改写，且改写结果与原文逐字相同 = 纯空转一跳）。
+_PRONOUNS = ("它", "他", "她", "这", "那", "此", "其", "该")
+# 多字指代短语用子串匹配：本身无歧义，且不依赖分词是否把它们切成一个词
+_PRONOUN_PHRASES = ("这个", "那个", "这些", "那些", "上述", "前面", "刚才",
+                    "该文档", "该标准", "该制度")
+
+
+@lru_cache(maxsize=1024)
+def _tokens(query: str) -> tuple[str, ...]:
+    """分词（与检索层同一套 jieba）。缺依赖 → 空元组，退化为只靠多字短语判回指。"""
+    try:
+        import jieba  # noqa: PLC0415 — 延迟导入，避免拖慢链路冷启动
+        return tuple(t for t in jieba.lcut(query or "") if t.strip())
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def _has_anaphora(query: str) -> bool:
+    """本句是否含回指：整词判单字代词 + 子串判多字短语。"""
+    q = (query or "").strip()
+    if any(p in q for p in _PRONOUN_PHRASES):
+        return True
+    return any(t in _PRONOUNS for t in _tokens(q))
 
 
 def rule_classify_intent(query: str) -> str | None:
@@ -94,7 +143,7 @@ def _is_self_contained(query: str) -> bool:
     q = (query or "").strip()
     if not q:
         return False
-    if any(h in q for h in _PRONOMINAL_HINTS):
+    if _has_anaphora(q):
         return False
     if len(q) <= _MIN_SELF_CONTAINED_LEN:
         return False

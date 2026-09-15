@@ -142,8 +142,9 @@ def main() -> int:
         cites = set(last["citations"])
         expected = set(case.expected_chunk_ids)
         # 净 history 代价的**构造式分解**（零 LLM）：Δprompt 实测混着「多一跳 rewrite」，
-        # 而本批 5/5 都走了 rewrite（见 ②），没有 hop 数相同的对照可用。故用「同题、同证据、
-        # 只切换 history 段」的方式分离出 history 本身的注入量：answer 一次 + rewrite 一次。
+        # 而末轮多数要走 rewrite（见 ②），hop 数与首轮不同的样本无法直接相减。故用
+        # 「同题、同证据、只切换 history 段」的方式分离出 history 本身的注入量：
+        # answer 一次 + rewrite 一次（independent 类跳过改写时只剩 answer 一次）。
         # verify 不注入 history（刻意设计），增量为 0。
         ev = prompts.render_evidence(res.items)
         _, a_wo = prompts.answer_prompt(last["effective_query"] or last["query"], ev, "")
@@ -197,10 +198,13 @@ def main() -> int:
         print(f"{r['id']} {r['turns'][-1]['history_chars']:>6}  "
               f"{ab['answer_history_chars']:>10}  {ab['rewrite_history_chars']:>11}  "
               f"{ab['rewrite_prompt_chars']:>10}  {net:>6}字 ≈{net / c2t:.0f}tok")
-    # 外推：render_history 窗口 = history_rounds 轮 × 2 条 × 每条 300 字（上限，非典型值）
-    per_inject = (settings.qa_history_rounds * 2 * 300) / c2t
+    # 外推：上限取两级预算的**生效值**（每条截断 × 轮数×2 条，与总量预算取小者）
+    per_msg_cap = settings.qa_history_rounds * 2 * settings.history_per_msg_chars
+    binding = "总量预算" if settings.history_total_chars < per_msg_cap else "每条×轮数"
+    per_inject = min(per_msg_cap, settings.history_total_chars) / c2t
     print("说明：history 被注入**两次**（rewrite 一跳 + answer 一跳）；verify 不注入（刻意设计）。"
-          f"\n      按窗口上限 {settings.qa_history_rounds} 轮 × 2 条 × 300 字外推："
+          f"\n      上限 = min(每条 {settings.history_per_msg_chars} 字 × {settings.qa_history_rounds} 轮 × 2 条"
+          f" = {per_msg_cap} 字, 总量预算 {settings.history_total_chars} 字) → 绑定的是**{binding}**："
           f"单次注入 ≈{per_inject:.0f} tok，**两次合计 ≈{per_inject * 2:.0f} tok**"
           f"（≈ 单问 prompt 的 {per_inject * 2 / 3000:.1f} 倍）。")
     print("      ⚠ 上表 Δprompt 不能当 history 成本用：它被 evidence 体量波动淹没"
@@ -250,6 +254,9 @@ def main() -> int:
             "cases": n_last,
             "turns_total": n_turns,
             "run_salt": salt,
+            "history_per_msg_chars": settings.history_per_msg_chars,
+            "history_total_chars": settings.history_total_chars,
+            "history_rounds": settings.qa_history_rounds,
         },
         "cost": {
             "llm_calls": total_calls,

@@ -20,6 +20,14 @@ services:
       LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-0}
       HTTP_READ_TIMEOUT_S: ${HTTP_READ_TIMEOUT_S:-120}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-0}
+      # 问答质量 / 重试上限 / 历史窗口 + 历史文本两级预算（2026-09-15 补登记：
+      # QA_* 三项此前一直漏在白名单外 → 容器内改不动，只能吃应用默认值）
+      QA_CONFIDENCE_THRESHOLD: ${QA_CONFIDENCE_THRESHOLD:-0.6}
+      QA_MAX_RETRY: ${QA_MAX_RETRY:-2}
+      QA_HISTORY_ROUNDS: ${QA_HISTORY_ROUNDS:-10}
+      # 历史被注入两次（rewrite + answer），预算从最新往旧累积、最新一轮必然保留
+      HISTORY_PER_MSG_CHARS: ${HISTORY_PER_MSG_CHARS:-150}
+      HISTORY_TOTAL_CHARS: ${HISTORY_TOTAL_CHARS:-1200}
       SERVICE_API_KEY: ${SERVICE_API_KEY:-}
       DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-tenant_demo}
       # 主题锚点词表路径（留空 = 用默认 ./data/kb_anchors.json）

@@ -418,6 +418,8 @@ class AgentResult(BaseModel):           # = done 事件 data（2.1 AssistantRepl
 - 分支逻辑（重试计数、置信度阈值、空检索短路、仅过期命中提示）在**条件边**实现；意图分类已合并进 answer 节点（同一次 LLM 调用产出 intent + answer），verify 只产出 grounded/confidence 判定，LLM 不决定流程走向
 - 空检索短路（成本关键）：`retrieved` 为空 → `no_data` 节点如实告知缺失，**0 次 LLM**（旧设计会白烧 answer+verify 两轮再转人工）；同时落一条 `event=kb_gap` 结构化日志（query/rewritten_query/thread_id），**仅作离线线索**供知识库管理员聚类缺失主题，不进任何人工作队列、不触发工单
 - 过期引用约束（F3.9）：citation.validity=expired 时 answer 内必须内嵌失效提示，Verify confidence 下调一档，纯过期支撑 → degraded=true
+- 零引用判据（2026-09-15）：`citations` 为空 → verify **不调 LLM** 直接判 `grounded=false / confidence=0`（无可回查出处即为未达标），落回 `retry（≤2）→ disclose` 出口；此时披露后缀用更重的一档 `_NO_CITE_SUFFIX`（"未能在现有知识库中找到对应出处，请勿直接作为依据"）。依据：四类出口里凡"给出答案"的（① 有资料→答案+出处；② 资料不全→现有数据+出处）都必须带出处
+- 历史文本预算（2026-09-15）：注入 prompt 的历史按「每条 `HISTORY_PER_MSG_CHARS` + 总量 `HISTORY_TOTAL_CHARS`」两级截断，**从最新往旧累积**（最新一轮必然保留、优先丢最旧）；历史被注入两次（rewrite 一跳 + answer 一跳），verify 不注入
 
 ---
 

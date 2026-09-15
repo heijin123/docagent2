@@ -246,16 +246,21 @@ class QANodes:
         # 证据按引用收窄（性能）：verify 的职责是核「答案的核心论断是否被**它引用的证据**支撑」
         # 与「引用标记是否对应真实证据行」——未被引用的候选对判定毫无贡献，
         # 却占 verify prompt 的 84%（实测 1,845 / 2,187 tok）。故只传被引用的证据行。
-        # 兜底：零引用、或引用 id 不在命中集 → 回退全量证据，保持既有判定行为不变
-        #（「零引用是否应视为未达标」是独立议题，不在本次改动范围，见待办①）。
         cited_ids = {c.get("chunk_id") for c in state.get("citations", []) if c.get("chunk_id")}
-        selected = [it for it in items if it.get("chunk_id") in cited_ids]
-        if selected:
-            use_items = selected
-            scope_note = f"verify: 证据按引用收窄 {len(selected)}/{len(items)} 条"
-        else:
-            use_items = items
-            scope_note = f"verify: 无有效引用 → 回退全量证据 {len(items)} 条"
+        if not cited_ids:
+            # 零引用 → 直接判未达标，**0 LLM 短路**（不再"回退全量证据照常判定"）。
+            # 依据出口纪律：凡**给出答案**的出口（① 有资料→答案+出处；② 资料不全→现有数据+出处）
+            # 都必须带出处；零引用恰恰是"不可回查的裸答案"（q007 曾 0 引用直接出货）。
+            # 这里不调 LLM：答案按构造即不可校验，判定是确定性的，没有可"判"的东西。
+            # 已知代价（可接受）：模型如实写"资料里没有这条"时也会被打回重试——但重试 hint
+            # 正是"如实说明资料不足之处与信息来源"，2 轮后落入 disclose（保留答案 + 披露后缀），
+            # 与出口③「查不到 → 告知缺失」语义一致，只是多花两次往返。
+            return {"grounded": False, "confidence": 0.0,
+                    "degraded": bool(state.get("degraded")),
+                    "notes": [*state.get("notes", []),
+                              f"verify: 零引用（检索 {len(items)} 条）→ 未达标（0 LLM 短路）"]}
+        use_items = [it for it in items if it.get("chunk_id") in cited_ids]
+        scope_note = f"verify: 证据按引用收窄 {len(use_items)}/{len(items)} 条"
         evidence = prompts.render_evidence(use_items)
         system, user = prompts.verify_prompt(q, state.get("answer", ""), evidence)
         # 性能：verify 只需 grounded + confidence 两个标量，收紧 max_tokens 抑制长 reason 拖慢

@@ -48,6 +48,11 @@ curl http://localhost:8000/api/v1/health
 | `LLM_ENABLE_THINKING` | 0 | 是否开思考模式。qwen3.8-flash **默认开思考**，实测单题 reasoning 占 314~877 token（用户看不见但按输出价计费、还串行拖慢）；关闭后同题 completion 1069→193 token |
 | `HTTP_READ_TIMEOUT_S` | 120 | LLM 读取超时；配合 `LLM_MAX_RETRIES=0` 杜绝 SDK 静默重发整段 prompt |
 | `LLM_MAX_RETRIES` | 0 | LLM 客户端重试次数；**保持 0**，重试由业务层可控退避接管 |
+| `QA_CONFIDENCE_THRESHOLD` | 0.6 | verify 置信度门槛；`grounded && confidence ≥ 门槛` 才判达标 |
+| `QA_MAX_RETRY` | 2 | verify 打回后的最大重试轮数；用尽 → disclose（保留答案 + 披露后缀，不转人工） |
+| `QA_HISTORY_ROUNDS` | 10 | 注入 prompt 的历史轮数窗口（消息侧另有 20 条硬截断）。**安全网**：`HISTORY_TOTAL_CHARS` 通常先于它生效 |
+| `HISTORY_PER_MSG_CHARS` | 150 | 单条历史消息截断长度 |
+| `HISTORY_TOTAL_CHARS` | 1200 | 历史文本总量预算；**从最新往旧累积**，超出即停 → 最新一轮必然保留、优先丢最旧。历史被注入**两次**（rewrite + answer），故实际占用 ≈ 预算的 2 倍 ≈ 1,400 tok/问；此前无预算时代上限约 7,500 tok/问 |
 | `SERVICE_API_KEY` | 空 | **生产必填**；启用 `Authorization: Bearer <key>` 鉴权 |
 | `REDIS_URL` | redis://localhost:6379/0 | checkpointer 地址 |
 | `REDIS_CHECKPOINTER_ENABLED` | 1 | 1=用 Redis 跨会话；0=强制内存 |

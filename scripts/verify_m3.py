@@ -27,6 +27,7 @@ from app.models import ChunkRecord, now_ts  # noqa: E402
 from app.agent import schemas  # noqa: E402
 from app.agent.graph import AgentApp, thread_config  # noqa: E402
 from app.agent.llm import StubLLM  # noqa: E402
+from app.core.config import settings  # noqa: E402
 from app.retrieval.bm25store import BM25Store  # noqa: E402
 from app.retrieval.embedding import Embedder  # noqa: E402
 from app.retrieval.hybrid import HybridRetriever  # noqa: E402
@@ -258,6 +259,68 @@ def main() -> int:
         check("12 轮后历史封顶 20 条", len(hist7) == 20, str(len(hist7)))
         check("窗口保留最近 10 轮（user 恰 10 条，最早 2 轮被截断）", user_n == 10,
               f"user={user_n}")
+
+        # ── render_history 两级预算（2026-09-15 新增）────────────────────
+        # 为什么要预算：旧实现是「窗口 10 轮 × 2 条 × 每条 300 字」= 6,000 字/次注入，
+        # 而 rewrite 与 answer **各注入一次** → 最坏约 7,500 tok/问（≈ 单问 prompt 的
+        # 2.3 倍）。单轮评估无历史、恒为 0，这个上限级风险单轮口径永远看不见。
+        # 现改为「每条截断 + 总量预算」，且**从最新往旧**累积：最新一轮必然保留，
+        # 优先丢最旧（消解指代依赖最近上文）。窗口退化为安全网。
+        from app.agent.prompts import render_history as _render_history
+        long_hist: list[dict] = []
+        for i in range(10):
+            long_hist.append({"role": "user", "content": f"第{i}轮问题" + "问" * 60})
+            long_hist.append({"role": "assistant", "content": f"第{i}轮回答" + "答" * 300})
+        rendered = _render_history(long_hist, max_rounds=10,
+                                   per_msg_chars=150, total_chars=1200)
+        check("预算生效：总长不超总量预算", len(rendered) <= 1200, f"len={len(rendered)}")
+        _last_line = rendered.split("\n")[-1]
+        check("最新一轮完整保留（末行 = 最近一轮回答，且截到 per_msg 上限）",
+              _last_line.startswith("助手: 第9轮回答") and len(_last_line) == 4 + 150,
+              f"len={len(_last_line)} head={_last_line[:22]!r}")
+        check("优先丢最旧（第0轮被丢弃）", "第0轮" not in rendered,
+              rendered[:60])
+        check("每条都截到 per_msg_chars（无 300 字原文残留）",
+              max(len(x) for x in rendered.split("\n")) <= 154,
+              str(max(len(x) for x in rendered.split("\n"))))
+        check("预算极小时至少保留一条（绝不返回空历史）",
+              bool(_render_history(long_hist, per_msg_chars=500, total_chars=10)))
+        check("空输入 → 空串（不抛错）", _render_history([], 10) == "")
+        check("默认配置下绑定的是总量预算（窗口已退化为安全网）",
+              settings.history_total_chars
+              < settings.qa_history_rounds * 2 * settings.history_per_msg_chars,
+              f"total={settings.history_total_chars} vs "
+              f"msg_cap={settings.qa_history_rounds * 2 * settings.history_per_msg_chars}")
+
+        # ── verify 零引用判据（2026-09-15 新增）──────────────────────────
+        # 出口纪律：凡「给出答案」的出口都必须带出处，零引用即不可回查的裸答案
+        #（q007 曾 0 引用直接出货）。故零引用 → 确定性判未达标，且**不调 LLM**。
+        from app.agent.nodes import QANodes
+        _stub = StubLLM()
+        _nodes = QANodes(rt, _stub)
+        _calls_before = _stub.meter.calls
+        _res_zero = _nodes.verify({
+            "query": "离职当年年假怎么折算", "answer": "按日工资折算。",
+            "retrieved": [{"chunk_id": "c1", "metadata": {}, "content": "年假可折算"}],
+            "citations": [], "notes": [],
+        })
+        check("零引用 → grounded=False", _res_zero["grounded"] is False)
+        check("零引用 → confidence 归零", _res_zero["confidence"] == 0.0)
+        check("零引用 → 不调 LLM（0 成本短路）", _stub.meter.calls == _calls_before,
+              f"{_calls_before} → {_stub.meter.calls}")
+        check("零引用 → note 以 verify 开头（last_verified 可识别）",
+              any(str(n).startswith("verify") for n in _res_zero["notes"]),
+              str(_res_zero["notes"]))
+        # 有引用时仍走 LLM 判定（不能把正常路径一起短路掉）
+        _res_cited = _nodes.verify({
+            "query": "离职当年年假怎么折算", "answer": "按日工资折算。[来源: 年假 第1页]",
+            "retrieved": [{"chunk_id": "c1", "metadata": {}, "content": "年假可折算"}],
+            "citations": [{"chunk_id": "c1", "validity": "valid"}], "notes": [],
+        })
+        check("有有效引用 → 仍调 LLM 判定（未把正常路径短路）",
+              _stub.meter.calls > _calls_before, f"calls={_stub.meter.calls}")
+        check("有引用 → 证据按引用收窄的 note 存在",
+              any("收窄" in str(n) for n in _res_cited["notes"]), str(_res_cited["notes"]))
 
         # ── F3.8' should_skip_rewrite 白名单判据（2026-09-14 重构）──────────
         # 语义：默认改写，只在本句被证明「自足」时才跳过；有无历史只作为

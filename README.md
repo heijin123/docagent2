@@ -43,12 +43,12 @@
 | 查询改写（F3.2） | 结合对话历史消歧；**短路判据为白名单**——默认改写，只在本句被证明"自足"（无回指 / 非极短 / 非「…的+通用中心词」/ 含主题锚点）时才跳过；主题锚点词表从语料自动生成（`app/agent/anchors.py` + `data/kb_anchors.json`，ingest 后自动重建）。无历史时不改写（无消解对象，避免模型编主题）。过期确认的自然语言放行（"是/查看"→ include_expired） |
 | 检索节点（F3.3） | 挂 F2 HybridRetriever；仅命中过期 → 发确认话术（无 interrupt，F2.8）；**检索为空 → no_data（0 LLM）** |
 | Answer（F3.4/F3.9） | 强制 `[来源: 文档 页码]` 引用格式 + 引用只允许来自证据（防编造）；资料不足直说且**不建议转人工**；过期引用失效提示规则进 prompt |
-| Verify（F3.5/F3.9） | 独立校验（输入只含引用内容+答案，不给思维链）；含过期引用 → confidence ≤0.5；纯过期支撑 → degraded=true |
+| Verify（F3.5/F3.9） | 独立校验（输入只含引用内容+答案，不给思维链）；证据按引用收窄（未被引用的候选对判定无贡献，曾占本跳 prompt 84%）；**零引用 → 确定性判未达标（0 LLM 短路）** → 重试 → 用尽则 disclose；含过期引用 → confidence ≤0.5；纯过期支撑 → degraded=true |
 | 防死循环（F3.6/F3.8） | 置信度/重试判定全在条件边：verify 不达标且 retry<2 → rewrite 回环；超限 → **disclose（保留答案 + 披露局限后缀）** |
 | 资料不足 / 转人工兜底 | `no_data`：如实告知缺失 + 指向管理员录入；`contact_guidance`：只给"该找谁"指引——两者均**不转交** |
-| 对话记忆（F4） | checkpointer 持久化（thread_id=`{tenant}:{user}`）；窗口截断最近 10 轮=20 条消息；每轮入口重置本轮输出字段防跨轮串扰 |
+| 对话记忆（F4） | checkpointer 持久化（thread_id=`{tenant}:{user}`）；消息窗口截断最近 10 轮=20 条；**历史文本两级预算**（每条 `HISTORY_PER_MSG_CHARS` + 总量 `HISTORY_TOTAL_CHARS`，从最新往旧累积、优先丢最旧）；每轮入口重置本轮输出字段防跨轮串扰 |
 | 双通道降级 | LLM：DashScope（QWEN_LLM_MODEL 可配，JSON/流式双模式，现用 Qwen3.8-Flash）/ 无 Key→Stub 规则式（保链路回归）；checkpointer：RedisSaver / 不可达→InMemorySaver（降级不掩盖） |
-| 验证 | `verify_m3.py`：47 断言（意图路由 / 引用达标链 / contact 指引 / 重试 2 次披露局限 / 空检索 no_data 0-LLM / 过期两轮流 / 记忆与窗口 / rewrite 短路判据）；`verify_cli_ingest.py`：14 断言（cmd_ingest 全路径） |
+| 验证 | `verify_m3.py`：60 断言（意图路由 / 引用达标链 / contact 指引 / 重试 2 次披露局限 / 空检索 no_data 0-LLM / 过期两轮流 / 记忆与窗口 + **历史预算** / rewrite 短路判据 / **零引用未达标**）；`verify_sse_streaming.py`：24 断言（含零引用不得直接出货）；`verify_cli_ingest.py`：14 断言（cmd_ingest 全路径） |
 
 ## M4 已交付能力
 
@@ -108,7 +108,7 @@ uv sync --dev                 # 清华镜像，Python ≥3.13（.python-version 
 .venv/Scripts/python.exe -m app.cli ingest data/samples   # 摄取（无 Key 自动 mock）
 .venv/Scripts/python.exe scripts/verify_m1.py       # M1 验证：41 断言
 .venv/Scripts/python.exe scripts/verify_m2.py       # M2 验证：30 断言
-.venv/Scripts/python.exe scripts/verify_m3.py       # M3 验证：47 断言（stub LLM + 内存检查点）
+.venv/Scripts/python.exe scripts/verify_m3.py       # M3 验证：60 断言（stub LLM + 内存检查点）
 .venv/Scripts/python.exe scripts/verify_cli_ingest.py  # CLI ingest 路径验证：14 断言（桩，覆盖 cmd_ingest 全路径）
 .venv/Scripts/python.exe scripts/verify_m4.py       # M4 验证：35 断言（TestClient + 隔离服务）
 .venv/Scripts/python.exe -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000   # 启动 API + Web 前端
@@ -205,7 +205,7 @@ data/chroma_db|bm25|registry.db|uploads  # 运行时数据（gitignore）
 |---|---|---|
 | M1 | 解析 + chunking + 质量门 + 双索引 + 幂等版本化 | ✅ 45/45 |
 | M2 | 混合检索：向量 + BM25 并行 + RRF + 年份/时效过滤 | ✅ 30/30 |
-| M3 | LangGraph 多 Agent：rewrite/retrieve/no_data/answer(合并意图)/verify/disclose + Redis checkpointer | ✅ 47/47（stub） |
+| M3 | LangGraph 多 Agent：rewrite/retrieve/no_data/answer(合并意图)/verify/disclose + Redis checkpointer | ✅ 60/60（stub） |
 | M4 | FastAPI：SSE 流式 + 文档上传 + 软删除 + debug/health | ✅ 35/35 |
 | M5 | 观测（JSON 日志+耗时埋点+慢操作）+ 压测脚本 + Docker/部署手册 | ✅ 42/42 |
 | M6 | 评估体系：golden recall@5/MRR + 引用可回查率（题集 55 条 / 语料 38 文档 105 chunk） | ✅ 19/19 |
@@ -216,3 +216,13 @@ data/chroma_db|bm25|registry.db|uploads  # 运行时数据（gitignore）
 > **`qwen3.8-flash` 默认开思考（reasoning），`max_tokens` 压不住它**（2026-09-14 实测）：同一道题 reasoning 占 314~877 completion token——用户看不见，却按**输出价**计费，且 token 是串行生成的、直接变成延迟（这是当时 P95 135.9s 的头号成因）。更坑的是 `max_tokens` **只约束可见正文**：设 64 时 `finish_reason=length`、正文被截断、JSON 不合法 → `complete_json` 白重试一次（成本翻倍）。所以"给 answer 限长"必须**关思考 + 限可见正文**一起做（`LLM_ENABLE_THINKING=0` + `ANSWER_MAX_TOKENS=512`）；只调 `max_tokens` 不但无效，还可能更亏。实测同 24 题：completion 57,320 → 5,638 token（-90%）、p50 41.8s → 6.2s、p95 135.9s → 11.1s，而 recall/可回查率**完全不变**。
 >
 > **CLI 子命令只跑 `--help` 等于没测**（2026-09-14 实测）：`cmd_ingest` 曾出现 `_rebuild_anchors` 函数体内混入 `cmd_ingest` 尾部代码（引用 `reports`/`ok`）→ 一旦真跑 ingest 就 `NameError`，而 `--help` 走的是 argparse、根本不进函数体，冒烟测试全绿也发现不了。凡新增 CLI 子命令行为，验证必须**真正调用该函数**（`scripts/verify_cli_ingest.py` 用桩驱动 `cmd_ingest`，覆盖返回码 / provider 行 / 词表重建 / 软失败 / 空输入 5 条路径）。
+>
+> **历史文本必须限长，而"单轮评估"结构上看不见这件事**（2026-09-15）：`render_history` 旧写法是「窗口 10 轮 × 2 条 × 每条 300 字」= 6,000 字/次注入，而历史在链路里被注入**两次**（rewrite 一跳 + answer 一跳；verify 刻意不注入）→ 最坏约 7,500 tok/问 ≈ 单问 prompt 的 2.3 倍。为什么九轮评估都没抓到：**单轮集没有历史，这一项恒为 0**；而当时的 5 条多轮样本**每条恰好 2 轮**，正好落在窗口阈值之下——既测不到 10 轮窗口，也几乎碰不到 300 字截断。现改为两级预算（`HISTORY_PER_MSG_CHARS=150` + `HISTORY_TOTAL_CHARS=1200`），且**从最新往旧累积**：最新一轮必然保留、优先丢最旧（消解指代依赖最近上文）；轮数窗口退化为安全网（预算先于窗口生效）。教训：**评估口径本身会决定你能看见哪些问题**——只在单轮场景测，多轮的成本结构永远是盲区。
+>
+> **零引用 = 不可回查的裸答案，必须判未达标**（2026-09-15）：四类出口里凡「给出答案」的（① 有资料→答案+出处；② 资料不全→现有数据+出处）都必须带出处，但 verify 此前的兜底是"零引用 → 回退全量证据照常判定"——模型只要说 grounded=true 就直接出货（q007 有前科），`disclose` 里那支 `_NO_CITE_SUFFIX`（"未能在现有知识库中找到对应出处"）因此**几乎成了死代码**。现在零引用一律确定性判 `grounded=False / confidence=0` 并**短路不调 LLM**（答案按构造即不可校验，没有可"判"的东西），落回既有的 retry→disclose 出口。副作用要认：模型如实写"资料里没有这条"时也会被打回重试（hint 正是"如实说明资料不足之处与信息来源"），最多多花两次往返后进披露。
+>
+> **⚠ 已知偏差：重试路径破坏「token 拼接 == done.answer」**（2026-09-15 实测暴露，**未修**）：verify 打回重试时，每次 answer 都会重新流式推送，于是 token 流里留下**多次尝试**的文本，而 `done.answer` 只有最后一次（+ 披露后缀）。影响可控——前端在 `done` 处用 `done.answer` **整体覆盖**重渲染（`web/index.html`），不会留下错误终态，只是流式中途的瞬态重影。要真正修好需要协议层加 `reset`/`retry` 事件（契约 §2.1 变更），已锁定在 `verify_sse_streaming.py` 的第 4 组断言里，避免它被当成"已修复"。
+>
+> **「单字代词必须按分词整词匹配，不能按子串」**（2026-09-15，多轮评估实测抓出）：`should_skip_rewrite` 的回指判定原先对 `("它","这","那",…)` 做**子串**匹配，于是「员工食堂**这**周的菜单是什么？」被判成指代句 → 强制执行一次改写，而改写结果与原文**逐字相同** = 纯空转一跳（长历史下每问白烧一次 rewrite）。改为 **jieba 整词判单字代词 + 子串判多字短语**（`_has_anaphora`）：`这周/那次/其他` 被 jieba 切成整词 → 不再误命中；`这个/上述/该文档` 这类多字指代仍靠子串兜住（自身无歧义，也不依赖分词边界）。代价是判据现在**依赖 jieba 是否把复合词切为整词**（缺依赖时退化为只判多字短语，偏保守）。修完单轮集自足率 81.8% → **89.1%**（此前约 4 道题被误判需改写），golden 多轮 **7/7**、人工探针 **13/13** 全对。教训与「词表干净才敢用子串匹配」同源：**任何"含某字即命中"的判据，先问分词边界**。
+>
+> **⚠ 修正：长历史样本并未真正触发总量预算**（2026-09-15 复测）：先前称"8 轮历史必然越过 `HISTORY_TOTAL_CHARS=1200`"**是错的**——真实答案平均约 90 字，8 轮只累计到 636~1,030 字。真实被触发的只有 **per-msg 150 字上限**（m007 出现多行恰好 154 字 = 前缀 4 + 150，答案被硬截在「[来源:」处）。故把 m007 由 8 轮补到 **10 轮历史**（恰为窗口上限，避免与轮数窗口混淆）使其真正越过 1,200；m006 保持 8 轮，作为「长历史但未截断」的对照下界。总量预算本身是确定性纯函数，四条行为（不超上限 / 优先丢最旧 / 极小预算保底非空 / 默认绑定总量）已由 `verify_m3` 零 LLM 断言覆盖——真跑样本的作用只是证明**真实历史确实能长到这个量级**。

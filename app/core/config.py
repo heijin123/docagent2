@@ -113,6 +113,14 @@ class Settings:
     )
     qa_max_retry: int = field(default_factory=lambda: _env_int("QA_MAX_RETRY", 2))
     qa_history_rounds: int = field(default_factory=lambda: _env_int("QA_HISTORY_ROUNDS", 10))
+    # 历史文本的两级预算（防多轮把 prompt 撑爆）。上限是怎么来的：窗口 10 轮 × 2 条
+    # × 每条 300 字 ≈ 6,000 字/次注入，而 rewrite 与 answer **各注入一次** → 最坏约
+    # 7,500 tok/问（≈ 单问 prompt 的 2.3 倍）；单轮评估恒为 0（无历史），看不见。
+    # 改「每条截断 + 总量预算」后最坏约 1,200 字 ≈ 710 tok，且最新一轮必然保留。
+    history_per_msg_chars: int = field(
+        default_factory=lambda: _env_int("HISTORY_PER_MSG_CHARS", 150))
+    history_total_chars: int = field(
+        default_factory=lambda: _env_int("HISTORY_TOTAL_CHARS", 1200))
 
     # ── Redis checkpointer（F4.1，M3）──────────────────────
     redis_url: str = field(default_factory=lambda: _env("REDIS_URL", "redis://localhost:6379/0"))

@@ -1,7 +1,7 @@
 """校验 `should_skip_rewrite` 白名单判据（纯规则，零 LLM）。
 
 对「旧实现（有历史就改写）」与新实现（白名单：自足才跳过）做离线回放，并
-统计新判据在语料上的真实行为：golden 多轮 5 条 / 单轮 55 条 / 人工探针。
+统计新判据在语料上的真实行为：golden 多轮 / 单轮 55 条 / 人工探针。
 
 用法：PYTHONPATH=D:/workspace/docagent2 python scripts/replay_skip_rewrite.py
 """
@@ -20,6 +20,12 @@ SINGLE = ROOT / "data" / "golden" / "qa_golden.json"
 MULTI = ROOT / "data" / "golden" / "qa_golden_multiturn.json"
 RESULT = ROOT / "data" / "reports" / "eval_multiturn_latest.json"
 
+# ⚠ 旧实现用的是**子串**匹配的回指词表，源码里已删（改为 prompts._has_anaphora 的整词匹配）。
+# 对照基准必须冻结在脚本里，不能跟着源码漂移，否则"旧 vs 新"就不再是同一个实验。
+# 这正是本次 m007 空转 bug 的根源：子串匹配会把「这周」「那次」「其他」误判成回指。
+_OLD_PRONOMINAL_HINTS = ("它", "他", "她", "这个", "那个", "这", "那", "其",
+                         "上述", "前面", "刚才", "再", "也")
+
 
 def judge_old(query: str, history: str, retry_count: int) -> bool:
     """旧实现（原样复刻，用于对照）。"""
@@ -30,7 +36,7 @@ def judge_old(query: str, history: str, retry_count: int) -> bool:
     q = (query or "").strip()
     if not q:
         return False
-    return not any(h in q for h in prompts._PRONOMINAL_HINTS)
+    return not any(h in q for h in _OLD_PRONOMINAL_HINTS)
 
 
 def judge_new(query: str, history: str, retry_count: int) -> bool:
@@ -44,7 +50,7 @@ def judge_no_veto(query: str, history: str, retry_count: int) -> bool:
     q = (query or "").strip()
     if not q:
         return False
-    ok = (not any(h in q for h in prompts._PRONOMINAL_HINTS)
+    ok = (not prompts._has_anaphora(q)
           and len(q) > prompts._MIN_SELF_CONTAINED_LEN
           and anchors.has_topic_anchor(q))
     if ok:
@@ -62,6 +68,7 @@ PROBES = [
     ("差旅报销的住宿上限是多少？", "跳过", "的紧邻「住宿」而非通用词，否决不触发"),
     ("企业发票怎么开？", "任意", "7 字 ≤ 8，被判需改写——短句下限的保守代价"),
     ("员工手册在哪里下载？", "跳过", "靠标题片段「工手」命中（结论正确、机制偶然）"),
+    ("员工食堂这周的菜单是什么？", "跳过", "含「这」但不是回指——整词匹配后不再误判（m007 回归）"),
     ("停车的呢？", "改写", "有锚点但 4 字 ≤ 8 → 短句下限拦住"),
     ("那二线城市呢？", "改写", "回指"),
     ("部门经理的标准是多少？", "改写", "「部门经理」实体不入词表，且无锚点"),
@@ -78,10 +85,11 @@ def main() -> None:
     print(f"          built_at={meta.get('built_at')}  max_df={meta.get('max_df')}")
     print()
 
-    print("=" * 100)
-    print("一、golden 多轮 5 条末轮（末轮有上文，判据真正起作用的地方）")
-    print("=" * 100)
     golden = json.loads(MULTI.read_text(encoding="utf-8"))
+    n_case = len(golden["cases"])
+    print("=" * 100)
+    print(f"一、golden 多轮 {n_case} 条末轮（末轮有上文，判据真正起作用的地方）")
+    print("=" * 100)
     res = json.loads(RESULT.read_text(encoding="utf-8"))
     hist = {c["id"]: c["final_history_text"] for c in res["per_case"]}
     ident = {c["id"]: c["turns"][-1]["rewrite_identity"] for c in res["per_case"]}
@@ -127,7 +135,7 @@ def main() -> None:
         if prompts._is_self_contained(q):
             continue
         why = []
-        if any(h in q for h in prompts._PRONOMINAL_HINTS):
+        if prompts._has_anaphora(q):
             why.append("回指")
         if len(q) <= prompts._MIN_SELF_CONTAINED_LEN:
             why.append(f"≤{prompts._MIN_SELF_CONTAINED_LEN}字")
