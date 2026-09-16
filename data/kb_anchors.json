@@ -1,6 +1,6 @@
 {
  "meta": {
-  "built_at": "2026-09-16 11:25:10",
+  "built_at": "2026-09-16 14:30:05",
   "source": "D:\\workspace\\docagent2\\data\\bm25\\corpus.db",
   "tokenizer": "jieba.posseg + title n-gram",
   "docs": 38,

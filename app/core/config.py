@@ -122,6 +122,11 @@ class Settings:
     history_total_chars: int = field(
         default_factory=lambda: _env_int("HISTORY_TOTAL_CHARS", 1200))
 
+    # ── VLM 红页转录（F1.9，M2）─────────────────────────
+    # 红页（扫描/乱码）走 Qwen-VL 转录为文本；VLM_ENABLED=1 且配 Key 才启用，否则降级原文。
+    vlm_enabled: bool = field(default_factory=lambda: _env_bool("VLM_ENABLED", False))
+    qwen_vlm_model: str = field(default_factory=lambda: _env("QWEN_VLM_MODEL", "qwen-vl-max"))
+
     # ── Redis checkpointer（F4.1，M3）──────────────────────
     redis_url: str = field(default_factory=lambda: _env("REDIS_URL", "redis://localhost:6379/0"))
     redis_checkpointer_enabled: bool = field(

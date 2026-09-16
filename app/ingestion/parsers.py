@@ -219,6 +219,11 @@ def _parse_markdown_text(text: str, doc_type: DocumentType,
 
 
 # ── DOCX：正文归一化为段落/表格/图片，标题样式映射 heading_level ──
+# 内联图（DrawingML blip）与关系 id 命名空间，DOCX 图片 OCR 需要 rId 才能取到图片字节
+_BLIP_TAG = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+_R_EMBED = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+
+
 @register_parser(DocumentType.DOCX)
 def _parse_docx(path: Path) -> ParsedDocument:
     import docx  # python-docx
@@ -233,9 +238,8 @@ def _parse_docx(path: Path) -> ParsedDocument:
     for child in body.iterchildren():
         tag = child.tag
         if tag == qn("w:p"):
-            para = _paragraph_from_xml(child, document)
-            if para is not None:
-                parsed.blocks.append(para)
+            for blk in _paragraph_blocks_from_xml(child, document):
+                parsed.blocks.append(blk)
         elif tag == qn("w:tbl"):
             table_block = _table_from_xml(child, document)
             if table_block is not None:
@@ -244,35 +248,54 @@ def _parse_docx(path: Path) -> ParsedDocument:
     return parsed
 
 
-def _paragraph_from_xml(p_element, document):
+def _inline_image_rids(p_element) -> list[str]:
+    """段落内联图的关系 id 列表（按出现顺序）。pipeline 据此取图字节做 OCR。"""
+    rids: list[str] = []
+    for blip in p_element.findall(".//" + _BLIP_TAG):
+        rid = blip.get(_R_EMBED)
+        if rid:
+            rids.append(rid)
+    return rids
+
+
+def _paragraph_blocks_from_xml(p_element, document) -> list[Block]:
+    """一个 WML 段落 → Block 列表（文本块 + 内联图占位块），保持阅读顺序。
+
+    与旧实现差异：① 文本与图共存时，文本不再被丢弃（旧版整段退化为一个 "[图片]" 块）；
+    ② 纯图段落也产占位块（旧版直接丢弃）；③ 每个内联图占位块带 `img_rid`，供 pipeline
+    取图做 VLM OCR。占位块 text="[图片]" 仅作位置标记，OCR 成功后会就地替换为文本。
+    """
     from docx.text.paragraph import Paragraph
 
     para = Paragraph(p_element, document)
     style_name = (para.style.name or "") if para.style else ""
     text = para.text.strip()
-    if not text:
-        return None
+    rids = _inline_image_rids(p_element)
+    blocks: list[Block] = []
 
-    # Heading 1~3 样式映射 section 层级（中文 Office 样式名也处理）
-    lowered = style_name.lower()
-    if "heading" in lowered or "标题" in style_name:
+    if text:
+        # Heading 1~3 样式映射 section 层级（中文 Office 样式名也处理）
+        lowered = style_name.lower()
         level = None
-        for candidate in (style_name, lowered):
-            for ch in candidate:
-                if ch.isdigit():
-                    level = int(ch)
+        if "heading" in lowered or "标题" in style_name:
+            for candidate in (style_name, lowered):
+                for ch in candidate:
+                    if ch.isdigit():
+                        level = int(ch)
+                        break
+                if level is not None:
                     break
-            if level is not None:
-                break
-        if level is None:
-            level = 1
-        if level <= 3:
-            return Block(block_type="heading", text=text, heading_level=level)
-        # 4+ 级标题当段落
-    # 检测是否只含图片（inline shape）
-    if para._p.findall(".//" + "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"):
-        return Block(block_type="image", text="[图片]", metadata={"has_inline_image": True})
-    return Block(block_type="paragraph", text=text)
+            if level is None:
+                level = 1
+        if level is not None and level <= 3:
+            blocks.append(Block(block_type="heading", text=text, heading_level=level))
+        else:
+            blocks.append(Block(block_type="paragraph", text=text))
+
+    for rid in rids:
+        blocks.append(Block(block_type="image", text="[图片]",
+                            metadata={"has_inline_image": True, "img_rid": rid}))
+    return blocks
 
 
 def _table_from_xml(tbl_element, document):
