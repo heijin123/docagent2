@@ -36,13 +36,10 @@ class Embedder:
 
     # ── dashscope ──────────────────────────────────────────
     def _embed_dashscope(self, texts: list[str]) -> list[list[float]]:
-        from openai import OpenAI
+        # 2026-09-15：复用进程级单例，避免每次调用新建连接（见 app.core.openai_client）
+        from app.core.openai_client import get_dashscope_client
 
-        client = OpenAI(
-            api_key=settings.dashscope_api_key,
-            base_url=settings.dashscope_base_url,
-            timeout=settings.read_timeout_s,
-        )
+        client = get_dashscope_client()
         results: list[list[float]] = []
         # 分批 ≤10 + 指数退避重试（doc-agent 实证：大批量 embedding 曾触发断连）
         for i in range(0, len(texts), settings.embedding_batch_size):

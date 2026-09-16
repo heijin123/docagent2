@@ -42,13 +42,10 @@ class DashScopeTranscriber(Transcriber):
         self.max_pages = max_pages or int(os.getenv("VLM_MAX_PAGES_PER_DOC", "20"))
 
     def transcribe(self, page_image_path: str, page_no: int) -> str | None:
-        from openai import OpenAI
+        # 2026-09-15：复用进程级单例，避免每次调用新建连接（见 app.core.openai_client）
+        from app.core.openai_client import get_dashscope_client
 
-        client = OpenAI(
-            api_key=settings.dashscope_api_key,
-            base_url=settings.dashscope_base_url,
-            timeout=settings.read_timeout_s,
-        )
+        client = get_dashscope_client()
         try:
             resp = client.chat.completions.create(
                 model=self.model,

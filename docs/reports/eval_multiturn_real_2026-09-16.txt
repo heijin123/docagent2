@@ -1,0 +1,112 @@
+Redis 不可达(Timeout connecting to server)，降级 InMemorySaver（本进程内持久化，重启丢失）
+checkpointer 降级: Redis 不可达(Timeout connecting to server) → 内存检查点
+Building prefix dict from the default dictionary ...
+Loading model from cache C:\Users\ADMINI~1\AppData\Local\Temp\jieba.cache
+Loading model cost 0.422 seconds.
+Prefix dict has been built successfully.
+{"ts": "2026-09-16T11:47:23", "level": "WARN", "event": "slow_query", "duration_ms": 1303.7, "threshold_ms": 500, "req_id": "", "query": "差旅住宿标准是多少？", "hits": 8, "used_roads": ["vector", "bm25"]}
+{"ts": "2026-09-16T11:47:29", "level": "WARN", "event": "slow_query", "duration_ms": 802.4, "threshold_ms": 500, "req_id": "", "query": "差旅住宿标准（2026 修订版）是什么时候开始执行的？", "hits": 8, "used_roads": ["vector", "bm25"]}
+{"ts": "2026-09-16T11:47:39", "level": "WARN", "event": "slow_query", "duration_ms": 559.5, "threshold_ms": 500, "req_id": "", "query": "部门经理出差住酒店一天最多能报多少钱", "hits": 8, "used_roads": ["vector", "bm25"]}
+{"ts": "2026-09-16T11:47:55", "level": "WARN", "event": "slow_query", "duration_ms": 547.1, "threshold_ms": 500, "req_id": "", "query": "年假跨年累计未用完的部分如何处理？", "hits": 8, "used_roads": ["vector", "bm25"]}
+{"ts": "2026-09-16T11:48:34", "level": "WARN", "event": "slow_query", "duration_ms": 586.2, "threshold_ms": 500, "req_id": "", "query": "差旅费用报销管理制度中部门经理的审批权限标准是多少？", "hits": 8, "used_roads": ["vector", "bm25"]}
+===== 多轮评估（7 条 / provider=dashscope）=====
+模型=deepseek-v4-flash-0731  价格=(0.0008, 0.0027)/1K  thread 盐值=20260916-114721
+
+--- 锚句定位自检 ---
+  m001 anaphora    期望块 1 → OK  | 本制度自 2026 年 1 月 1 日起执行
+  m002 ellipsis    期望块 1 → OK  | 部门经理 | 一线城市 | 1100/天
+  m003 independent 期望块 1 → OK  | 员工月卡 150 元
+  m004 anaphora    期望块 1 → OK  | 折算标准为日工资的 200%
+  m005 ellipsis    期望块 1 → OK  | 每人每天 120 元
+  m006 ellipsis    期望块 1 → OK  | 部门经理 | 一线城市 | 1100/天
+  m007 independent 期望块 1 → OK  | 周一：红烧排骨、清炒时蔬
+
+  m001 第1轮   5968ms calls=2 rewrite=skip      prompt=1974   cites=2 hist=169字 | 差旅住宿标准是多少？
+  m001 第2轮   5879ms calls=3 rewrite=llm       prompt=2804   cites=1 hist=280字 | 这个标准是什么时候开始执行的？
+  m002 第1轮   3520ms calls=2 rewrite=skip      prompt=2251   cites=1 hist=158字 | 出差住酒店一天最多能报多少钱？
+  m002 第2轮   5358ms calls=3 rewrite=llm       prompt=2137   cites=1 hist=252字 | 部门经理的标准是多少？
+  m003 第1轮   3679ms calls=2 rewrite=skip      prompt=1959   cites=2 hist=169字 | 差旅住宿标准是多少？
+  m003 第2轮   3071ms calls=2 rewrite=skip      prompt=2435   cites=1 hist=258字 | 园区停车月卡多少钱？
+  m004 第1轮   3876ms calls=2 rewrite=skip      prompt=2263   cites=2 hist=134字 | 年假可以跨年累计多少天？
+  m004 第2轮   5607ms calls=3 rewrite=llm       prompt=3093   cites=2 hist=298字 | 那它没用完的部分怎么处理？
+  m005 第1轮   3681ms calls=2 rewrite=skip      prompt=2016   cites=2 hist=172字 | 差旅报销的住宿上限是多少？
+  m005 第2轮   5633ms calls=3 rewrite=llm       prompt=2589   cites=2 hist=320字 | 那市内交通补贴呢？
+  m006 第1轮   3123ms calls=2 rewrite=skip      prompt=2326   cites=1 hist=90字 | 园区停车月卡多少钱？
+  m006 第2轮   3042ms calls=2 rewrite=skip      prompt=2550   cites=1 hist=161字 | 停车月卡违停几次会被取消资格？
+  m006 第3轮   2999ms calls=2 rewrite=skip      prompt=2248   cites=1 hist=233字 | 年假可以跨年累计多少天？
+  m006 第4轮   3143ms calls=2 rewrite=skip      prompt=2553   cites=1 hist=316字 | 未休完的年假怎么折算？
+  m006 第5轮   3026ms calls=2 rewrite=skip      prompt=2781   cites=1 hist=415字 | 员工食堂几点开餐？
+  m006 第6轮   3490ms calls=2 rewrite=skip      prompt=3385   cites=2 hist=534字 | 新员工入职要交哪些材料？
+  m006 第7轮   4146ms calls=2 rewrite=skip      prompt=2782   cites=2 hist=689字 | 出差住酒店一天最多能报多少钱？
+  m006 第8轮   5185ms calls=3 rewrite=llm       prompt=3274   cites=1 hist=783字 | 部门经理的标准是多少？
+  m007 第1轮   4227ms calls=2 rewrite=skip      prompt=1964   cites=2 hist=169字 | 差旅住宿标准是多少？
+  m007 第2轮   4490ms calls=2 rewrite=skip      prompt=2601   cites=3 hist=339字 | 市内交通补贴是多少？
+  m007 第3轮   3532ms calls=2 rewrite=skip      prompt=2544   cites=1 hist=431字 | 园区停车月卡多少钱？
+  m007 第4轮   4103ms calls=2 rewrite=skip      prompt=2370   cites=2 hist=598字 | 年假有多少天？
+  m007 第5轮   3761ms calls=2 rewrite=skip      prompt=3575   cites=1 hist=765字 | 加班费怎么算？
+  m007 第6轮   3593ms calls=2 rewrite=skip      prompt=3599   cites=2 hist=894字 | 请假需要提前多久提交申请？
+  m007 第7轮   4121ms calls=2 rewrite=skip      prompt=2973   cites=2 hist=1065字 | 报销需要提供哪些凭证？
+  m007 第8轮   3040ms calls=2 rewrite=skip      prompt=3434   cites=1 hist=1147字 | 每月最多能补卡几次？
+  m007 第9轮   3438ms calls=2 rewrite=skip      prompt=4261   cites=2 hist=1148字 | 办公设备多久保养一次？
+  m007 第10轮   3432ms calls=2 rewrite=skip      prompt=3870   cites=2 hist=1131字 | 新员工入职要交哪些材料？
+  m007 第11轮   3791ms calls=2 rewrite=skip      prompt=3731   cites=1 hist=1200字 | 员工食堂这周的菜单是什么？
+
+===== ① prompt 增量（末轮 − 首轮，同题内对照，含真实 history 复现）=====
+id    category    hop1 hop2  prompt1  prompt2   Δprompt  Δ%     末轮hist
+m001 anaphora    2    3     1974     2804      830       42.0%   169字
+m002 ellipsis    2    3     2251     2137      -114      -5.1%   158字
+m003 independent 2    2     1959     2435      476       24.3%   169字
+m004 anaphora    2    3     2263     3093      830       36.7%   134字
+m005 ellipsis    2    3     2016     2589      573       28.4%   172字
+m006 ellipsis    2    3     2326     3274      948       40.8%   689字
+m007 independent 2    2     1964     3731      1767      90.0%  1131字
+
+--- 构造式分解（零 LLM）：Δ 里多少是 history、多少是『多那一跳 rewrite』---
+id    hist字  →answer注入  →rewrite注入  rewrite整跳  history净增
+m001    169         169          169         207     338字 ≈211tok
+m002    158         158          158         192     316字 ≈198tok
+m003    169         169          169         202     338字 ≈211tok
+m004    134         134          134         170     268字 ≈168tok
+m005    172         172          172         204     344字 ≈215tok
+m006    689         689          689         723    1378字 ≈861tok
+m007   1131        1131         1131        1167    2262字 ≈1414tok
+说明：history 被注入**两次**（rewrite 一跳 + answer 一跳）；verify 不注入（刻意设计）。
+      上限 = min(每条 150 字 × 10 轮 × 2 条 = 3000 字, 总量预算 1200 字) → 绑定的是**总量预算**：单次注入 ≈750 tok，**两次合计 ≈1500 tok**（≈ 单问 prompt 的 0.5 倍）。
+      ⚠ 上表 Δprompt 不能当 history 成本用：它被 evidence 体量波动淹没（m002 甚至为负）—— 只有『同题同证据、只切 history』的构造值才是净成本。
+
+===== ② should_skip_rewrite 分类行为 =====
+期望：指代/省略 → 必须 rewrite(llm)｜独立新问题 → 应跳过(skip)
+  m001 anaphora    期望=llm  实际=llm  ✓  calls=3  | 这个标准是什么时候开始执行的？
+        改写 → 差旅住宿标准（2026 修订版）是什么时候开始执行的？
+  m002 ellipsis    期望=llm  实际=llm  ✓  calls=3  | 部门经理的标准是多少？
+        改写 → 部门经理出差住酒店一天最多能报多少钱
+  m003 independent 期望=skip 实际=skip ✓  calls=2  | 园区停车月卡多少钱？
+  m004 anaphora    期望=llm  实际=llm  ✓  calls=3  | 那它没用完的部分怎么处理？
+        改写 → 年假跨年累计未用完的部分如何处理？
+  m005 ellipsis    期望=llm  实际=llm  ✓  calls=3  | 那市内交通补贴呢？
+        改写 → 差旅报销中市内交通补贴的标准是多少
+  m006 ellipsis    期望=llm  实际=llm  ✓  calls=3  | 部门经理的标准是多少？
+        改写 → 差旅费用报销管理制度中部门经理的审批权限标准是多少？
+  m007 independent 期望=skip 实际=skip ✓  calls=2  | 员工食堂这周的菜单是什么？
+  跳过率 2/7；其中空转改写 0 条（空转 = 花了 LLM 一跳但产出与原文逐字相同）
+
+===== ③ 末轮引用可回查 + 锚句命中 =====
+  m001 anaphora    可回查=True 锚句命中=True cites=1 intent=kb_qa conf=0.0 | 期望 policy_travel_expense_v2_2026-01-01.md
+        A: 《差旅费用报销管理制度（2026 修订版）》自 2026 年 1 月 1 日起执行，同时 2025 版废止[来源: 差旅费用报销管理制度（2026 修订版） 第 3 页]。
+  m002 ellipsis    可回查=True 锚句命中=True cites=1 intent=kb_qa conf=0.0 | 期望 policy_travel_expense_v2_2026-01-01.md
+        A: 部门经理出差住宿上限为：一线城市1100元/天，二线城市550元/天，需电子发票。[来源: 差旅费用报销管理制度（2026 修订版） 第 2 页]
+  m003 independent 可回查=True 锚句命中=True cites=1 intent=kb_qa conf=0.0 | 期望 misc_parking_guide.md
+        A: 园区停车月卡为150元，季度卡400元，年卡1500元；访客车辆前2小时免费，超出部分每小时5元[来源: 园区停车管理规定 第 1 页]。
+  m004 anaphora    可回查=True 锚句命中=True cites=2 intent=kb_qa conf=0.0 | 期望 hr_annual_leave_2026.md
+        A: 年假跨年累计未用完的部分，可跨年累计不超过10天，超出部分自动作废；因工作原因未休完的，可申请按日工资200%折算为工资。[来源: 年假管理规定（2026 修订） 第 1 页] 另有文档规定上限为5天，但未标注年份，可能已过时，请以现行制度为准。[来源: 员工休假制度 第 1 页]
+  m005 ellipsis    可回查=True 锚句命中=True cites=2 intent=kb_qa conf=0.0 | 期望 policy_travel_expense_v2_2026-01-01.md
+        A: 根据2026年修订版制度，市内交通补贴为每人每天120元，无需提供票据[来源: 差旅费用报销管理制度（2026 修订版） 第 3 页]。注意，2025版制度已废止，其标准（每人每天80元）不再适用[来源: 差旅费用报销管理制度（2025 版） 第 3 页]。
+  m006 ellipsis    可回查=True 锚句命中=False cites=1 intent=kb_qa conf=0.0 | 期望 policy_travel_expense_v2_2026-01-01.md
+        A: 部门经理的审批权限为单次差旅报销总额在8000元以内，超过8000元须报总监审批。[来源: 差旅费用报销管理制度（2026 修订版） 第 1 页]
+  m007 independent 可回查=True 锚句命中=True cites=1 intent=kb_qa conf=0.0 | 期望 misc_canteen_menu.txt
+        A: 员工食堂本周菜单为：周一红烧排骨、清炒时蔬、紫菜蛋花汤；周二番茄牛腩、蒜蓉西兰花、冬瓜排骨汤；周三宫保鸡丁、手撕包菜、玉米浓汤；周四清蒸鲈鱼、干煸四季豆、银耳莲子羹；周五黑椒牛柳、上汤娃娃菜、酸辣汤。供餐时间为早餐07:30-09:00、午餐11:30-13:30、晚餐17:30-19:00，食堂位于B座一层[来源: 
+
+===== 汇总（7 条 / 29 轮真实 LLM）=====
+调用 63 次 | prompt 80342 tok / completion 4836 tok | 成本 ¥0.0773 | 单轮均 2937.2 tok
+末轮：引用可回查 7/7 = 1.000 | 锚句命中 6/7 = 0.857
+报告: D:\workspace\docagent2\data\reports\eval_multiturn_latest.json

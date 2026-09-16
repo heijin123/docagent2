@@ -186,7 +186,16 @@ class QANodes:
                     "notes": [*state.get("notes", []),
                               "answer: 要求转人工 → 仅给联系指引（不转交、不建单）"]}
 
-        evidence = prompts.render_evidence(state.get("retrieved", []))
+        # 重试时不再全额重发 prompt：上一轮已引用的证据才是校验关心的范围
+        # （verify 也是按引用收窄的，全量候选对修正答案无贡献、且占 prompt 大头）。
+        # 故重试轮只重渲「上轮 answer 实际引用的证据条」，无引用（不应发生）则回退全量。
+        retrieved = state.get("retrieved", [])
+        if state.get("retry_count", 0) > 0 and state.get("citations"):
+            cited_ids = {c.get("chunk_id") for c in state.get("citations") if c.get("chunk_id")}
+            ev_items = [it for it in retrieved if it.get("chunk_id") in cited_ids] or retrieved
+        else:
+            ev_items = retrieved
+        evidence = prompts.render_evidence(ev_items)
         # 重试 hint 只要求"如实说明、不得编造"，**不再**暗示"补充引用以通过校验"
         # ——旧文案会诱导模型堆砌/伪造引用去骗过 verify。
         retry_hint = ("请如实说明资料的不足之处与信息来源，不要编造或堆砌引用"

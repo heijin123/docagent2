@@ -30,9 +30,13 @@ def render_evidence(items: Iterable[dict]) -> str:
         validity = it.get("validity", "valid")
         flag = "| expired" if validity == "expired" else ""
         content = (it.get("content") or "").replace("\n", " ").strip()
+        # page_num 缺失（md/docx/txt 无页码，或 chunking 落 None）一律渲染为「—」，
+        # 否则会显示「第 0 页」被模型照抄进引用，误导用户（2026-09-15 修正）。
+        page = m.get("page_num") or 0
+        page_label = f"第 {page} 页" if page and page > 0 else "—"
         lines.append(
             f"[c{idx}] {it['chunk_id']} | {m.get('doc_title', '')} "
-            f"| 第 {m.get('page_num', 0)} 页 | {m.get('doc_date', '') or ''}{flag} | {content[:500]}"
+            f"| {page_label} | {m.get('doc_date', '') or ''}{flag} | {content[:500]}"
         )
     return "\n".join(lines)
 
@@ -119,7 +123,7 @@ def rule_classify_intent(query: str) -> str | None:
     return None
 
 
-_MIN_SELF_CONTAINED_LEN = 8
+_MIN_SELF_CONTAINED_LEN = 6
 
 
 def _has_generic_head_after_de(q: str) -> bool:
@@ -136,9 +140,13 @@ def _is_self_contained(query: str) -> bool:
 
     四条同时成立才算自足（任一不满足 → 视为需要上下文的消解）：
     1. 无回指（它/这个/那… 没有前文无从消解）；
-    2. 非极短句（≤ 8 字信息量不足）；
+    2. 非极短句（≤ 6 字信息量不足）；
     3. 非「…的 + 通用中心词」结构（主题落在修饰语上，而修饰语常是角色/实体）；
     4. 含主题锚点（词表由语料自动生成，见 app/agent/anchors.py）。
+
+    注：短句下限 2026-09-15 由 8 下调至 6（零 LLM 回放验证 golden 7/7、探针 13/13、
+    单轮自足数均不变）。6 字以下的「停车的呢？」「年假呢？」这类省略/短问仍判需改写，
+    属已知保守代价。
     """
     q = (query or "").strip()
     if not q:

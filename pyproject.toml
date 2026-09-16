@@ -12,6 +12,7 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "jieba>=0.42.1",
     "langgraph>=1.2.11",
+    "markitdown[pdf]>=0.1.7",
     "langgraph-checkpoint-redis>=0.5,<1",
     "redis>=5.0",
     "fastapi>=0.115",

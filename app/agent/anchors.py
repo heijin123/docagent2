@@ -141,6 +141,28 @@ def _title_of(content: str, max_len: int = 24) -> str:
     return _CHAPTER_RE.split(head)[0][:max_len].strip()
 
 
+def _composites_from(tokens) -> set[str]:
+    """相邻 CJK token 拼接成复合词（2~4 字，过 `_blocked`）。
+
+    jieba 常把「加班费」切成「加班/费」、「餐补」切成「餐/补」——单字/双字被拆后，
+    真话题词反而进不了词表（且「加班」跨文档 DF 超限被过滤）。把相邻 token 重新拼回，
+    复合词只在少数文档出现 → DF 带内 → 被保留为锚点（如「加班费」「餐补」）。
+    按相邻成对拼接（不跨标点、不跨句），长度限 2~4 字避免噪音。
+    """
+    out: set[str] = set()
+    run: list[str] = []
+    for w, _f in tokens:
+        if _CJK_RE.match(w):
+            run.append(w)
+            if len(run) >= 2:
+                g = run[-2] + run[-1]
+                if 2 <= len(g) <= 4 and not _blocked(g):
+                    out.add(g)
+        else:
+            run = []
+    return out
+
+
 def build_vocab(db_path: str | Path, out_path: str | Path,
                 max_df: int = 8) -> dict:
     """从 BM25 语料生成锚点词表并落盘，返回 meta（语料变更后需重建）。
@@ -160,6 +182,7 @@ def build_vocab(db_path: str | Path, out_path: str | Path,
         by_doc.setdefault(doc_id, []).append((chunk_id, content or ""))
 
     term_doc: dict[str, set[str]] = {}
+    composite_doc: dict[str, set[str]] = {}
     title_tokens: set[str] = set()
     title_ngrams: set[str] = set()
     titles: dict[str, str] = {}
@@ -168,20 +191,27 @@ def build_vocab(db_path: str | Path, out_path: str | Path,
         chunks.sort()
         title = _title_of(chunks[0][1])
         titles[doc_id] = title
-        for w, f in pseg.lcut(title):
+        title_toks = list(pseg.lcut(title))
+        for w, f in title_toks:
             if f[0] in _KEEP_POS and not _blocked(w):
                 title_tokens.add(w)
         for i in range(len(title) - 1):
             g = title[i:i + 2]
             if not _blocked(g):
                 title_ngrams.add(g)
+        for g in _composites_from(title_toks):
+            composite_doc.setdefault(g, set()).add(doc_id)
         for _cid, content in chunks:
-            for w, f in pseg.lcut(content):
+            content_toks = list(pseg.lcut(content))
+            for w, f in content_toks:
                 if f[0] in _KEEP_POS and not _blocked(w):
                     term_doc.setdefault(w, set()).add(doc_id)
+            for g in _composites_from(content_toks):
+                composite_doc.setdefault(g, set()).add(doc_id)
 
     body_terms = {t for t, docs in term_doc.items() if 1 <= len(docs) <= max_df}
-    terms = sorted(title_tokens | title_ngrams | body_terms)
+    body_composites = {t for t, docs in composite_doc.items() if 1 <= len(docs) <= max_df}
+    terms = sorted(title_tokens | title_ngrams | body_terms | body_composites)
     data = {
         "meta": {
             "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -191,6 +221,7 @@ def build_vocab(db_path: str | Path, out_path: str | Path,
             "counts": {"title_tokens": len(title_tokens),
                        "title_ngrams": len(title_ngrams - title_tokens),
                        "body_tokens": len(body_terms - title_tokens - title_ngrams),
+                       "body_composites": len(body_composites - title_tokens - title_ngrams - body_terms),
                        "union": len(terms)},
         },
         "titles": titles,

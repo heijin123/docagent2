@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-
+import re
 from app.ingestion.detection import detect_document_type
 from app.ingestion.pdf_quality import PageQuality
 from app.models import Block, DocumentType
@@ -79,6 +79,54 @@ def _parse_txt(path: Path) -> ParsedDocument:
 def _parse_markdown(path: Path) -> ParsedDocument:
     text = _read_text(path)
     parsed = ParsedDocument(doc_type=DocumentType.MD, file_path=str(path))
+    blocks = _parse_markdown_text(text, DocumentType.MD)
+    parsed.blocks = blocks
+    if any(b.metadata.get("unclosed") for b in blocks):
+        parsed.warnings.append("代码围栏未闭合")
+    return parsed
+
+
+def _is_cjk_heading(line: str) -> bool:
+    """中文章节/条目标题判定（markitdown 0.1.7 对「第X章」不输出 #，需补回）。"""
+
+    s = line.strip()
+    if not s or len(s) > 40:
+        return False
+    pat = re.compile(
+        r"^(第[0-9一二三四五六七八九十百千]+章"
+        r"|第[0-9一二三四五六七八九十百千]+节"
+        r"|[一二三四五六七八九十]+、"
+        r"|[0-9]+(\.[0-9]+)*[.\、]\s*[\u4e00-\u9fff])"
+    )
+    return bool(pat.match(s))
+
+
+def _cjk_heading_level(line: str) -> int:
+    """中文标题 → heading_level（章=1，节/条=2，其余=3；编号 1.1=2）。"""
+ 
+    s = line.strip()
+    if "章" in s:
+        return 1
+    if re.match(r"^[0-9]+(\.[0-9]+)*[.\、]", s):
+        dots = s.split(" ")[0].count(".")
+        return min(dots + 1, 3)
+    if "节" in s or "条" in s:
+        return 2
+    return 3
+
+
+def _parse_markdown_text(text: str, doc_type: DocumentType,
+                         *, recover_cjk_headings: bool = False) -> list[Block]:
+    """Markdown 文本 → Block 序列（heading/table/code/image/paragraph）。
+
+    抽出为纯函数供 PDF 路径复用：markitdown 把单页 PDF 转成 Markdown 后，PDF 解析器
+    按页调用本函数得到带 page 的结构块，从而拿到页内结构 + 准确页码（block.page
+    由调用方回填，本函数不负责页码）。
+
+    recover_cjk_headings：仅 PDF 路径开启。markitdown 0.1.7 对中文「第X章/第X节」
+    不输出 `#` 标题，此处按章节模式补回 heading 块，使 PDF 也具备标题结构。
+    """
+    blocks: list[Block] = []
     lines = text.split("\n")
     i = 0
     n = len(lines)
@@ -92,7 +140,7 @@ def _parse_markdown(path: Path) -> ParsedDocument:
         text_piece = "\n".join(buf).strip()
         buf = []
         if text_piece:
-            parsed.blocks.append(Block(block_type="paragraph", text=text_piece))
+            blocks.append(Block(block_type="paragraph", text=text_piece))
 
     while i < n:
         line = lines[i]
@@ -105,7 +153,7 @@ def _parse_markdown(path: Path) -> ParsedDocument:
             else:
                 in_code = False
                 code_text = "\n".join(code_buf)
-                parsed.blocks.append(
+                blocks.append(
                     Block(block_type="code", text=code_text, metadata={"language": code_lang})
                 )
             i += 1
@@ -115,24 +163,29 @@ def _parse_markdown(path: Path) -> ParsedDocument:
             i += 1
             continue
 
-        # 标题
+        # 标题（# 前缀；PDF 路径可选 recover_cjk_headings 补中文「第X章/节」标题）
         stripped = line.lstrip()
+        heading_text = None
+        heading_level = None
         if stripped.startswith("#"):
+            heading_text = stripped.lstrip("#").strip()
+            heading_level = min(len(stripped) - len(stripped.lstrip("#")), 6)
+        elif recover_cjk_headings and _is_cjk_heading(stripped):
+            heading_text = stripped
+            heading_level = _cjk_heading_level(stripped)
+        if heading_text:
             flush_paragraph()
-            level = len(stripped) - len(stripped.lstrip("#"))
-            title = stripped.lstrip("#").strip()
-            if title:
-                parsed.blocks.append(
-                    Block(block_type="heading", text=title,
-                          heading_level=min(level, 6), metadata={"line_no": i + 1})
-                )
+            blocks.append(
+                Block(block_type="heading", text=heading_text,
+                      heading_level=heading_level, metadata={"line_no": i + 1})
+            )
             i += 1
             continue
 
         # 图片语法 ![alt](url)
         if stripped.startswith("![") and "](http" in stripped:
             alt = stripped[2:].split("](")[0]
-            parsed.blocks.append(
+            blocks.append(
                 Block(block_type="image", text=alt,
                       metadata={"alt": alt, "src": stripped.split("](")[1].rstrip(")")})
             )
@@ -144,7 +197,7 @@ def _parse_markdown(path: Path) -> ParsedDocument:
             table_lines, i = _collect_table(lines, i)
             if table_lines is not None:
                 flush_paragraph()
-                parsed.blocks.append(
+                blocks.append(
                     Block(block_type="table", text="\n".join(table_lines),
                           metadata={"md_table": True})
                 )
@@ -159,11 +212,10 @@ def _parse_markdown(path: Path) -> ParsedDocument:
         i += 1
 
     flush_paragraph()
-    if in_code:  # 未闭合围栏：按代码块收下并警告
-        parsed.blocks.append(Block(block_type="code", text="\n".join(code_buf),
-                                   metadata={"language": code_lang, "unclosed": True}))
-        parsed.warnings.append("代码围栏未闭合")
-    return parsed
+    if in_code:  # 未闭合围栏：按代码块收下（警告由调用方按 parsed 加）
+        blocks.append(Block(block_type="code", text="\n".join(code_buf),
+                            metadata={"language": code_lang, "unclosed": True}))
+    return blocks
 
 
 # ── DOCX：正文归一化为段落/表格/图片，标题样式映射 heading_level ──
@@ -240,10 +292,22 @@ def _table_from_xml(tbl_element, document):
                  metadata={"rows": len(table.rows), "cols": len(table.columns)})
 
 
-# ── PDF：逐页取文本（PyMuPDF），版面质量门判级，图登记 ──
+# ── PDF：markitdown 出页内结构 + PyMuPDF 保质量门与页码 ──
 @register_parser(DocumentType.PDF)
 def _parse_pdf(path: Path) -> ParsedDocument:
+    """PDF → 整文档 markitdown 转 Markdown（\\f 分隔页）→ 逐页切片 → 结构块（heading/table/paragraph）。
+
+    设计取舍（对比原 PyMuPDF 整页 1 块）：
+    - 整文档转一次，再按 \\f 切成逐页片段，每段独立走 MD 解析并打 PyMuPDF 页码
+      （页码权威来源 = PyMuPDF 页序，不依赖 markitdown 对单页 PDF 的页码判断，更稳）；
+      每块天然带正确 page 页码（解决原「1 页=1 块、引用指错页」）；
+    - markitdown 0.1.7 对中文「第X章」不输出 `#`，故 PDF 路径开启 recover_cjk_headings
+      把章节行补成 heading 块；
+    - 页眉页脚按「块文本跨 >=3 页出现在页首/页尾，或每页都出现」剔除；
+    - 红页（扫描/乱码）markitdown 亦无能为力，退回 PyMuPDF 原文降级入库（VLM 桩未接）。
+    """
     import pymupdf
+    from markitdown import MarkItDown
 
     parsed = ParsedDocument(doc_type=DocumentType.PDF, file_path=str(path))
     doc = pymupdf.open(str(path))
@@ -251,47 +315,118 @@ def _parse_pdf(path: Path) -> ParsedDocument:
     if doc.needs_pass:
         raise UnsupportedFormatError(path, "加密 PDF（DOC_ENCRYPTED）")
 
-    # 页眉页脚剔除：同一行文本连续 >=3 页出现在页首/页尾 → 剔除
-    first_lines: dict[str, int] = {}
-    last_lines: dict[str, int] = {}
+    md = MarkItDown()
 
-    page_texts: list[str] = []
-    for page_no, page in enumerate(doc, start=1):
-        text = page.get_text("text")
-        page_texts.append(text)
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if lines:
-            first_lines[lines[0]] = first_lines.get(lines[0], 0) + 1
-            last_lines[lines[-1]] = last_lines.get(lines[-1], 0) + 1
+    # 整文档转一次 Markdown（markitdown 用 \f 分隔页）；再按 \f 切成逐页片段，
+    # 每段独立走 MD 解析并打 PyMuPDF 页码（页码权威来源 = PyMuPDF 页序，不依赖
+    # markitdown 对单页 PDF 的页码判断，更稳）。
+    try:
+        whole = md.convert(str(path))
+        whole_md = getattr(whole, "markdown", "") or ""
+    except Exception:  # noqa: BLE001 — 整文档转换失败则退回逐页原文
+        whole_md = ""
 
-    repeat_first = {k for k, v in first_lines.items() if v >= 3}
-    repeat_last = {k for k, v in last_lines.items() if v >= 3}
+    page_md_segments = _split_markdown_by_page(whole_md, doc.page_count)
 
-    for page_no, text in enumerate(page_texts, start=1):
-        # 图片计数（页内 image xobjects 去重）
+    # 每页块区间 + 首/尾块文本，供页眉页脚剔除
+    page_ranges: list[tuple[int, int]] = []
+
+    for page_no in range(1, doc.page_count + 1):
+        page = doc[page_no - 1]
         try:
-            images = doc[page_no - 1].get_images(full=True)
-            image_count = len(images)
+            image_count = len(page.get_images(full=True))
         except Exception:  # noqa: BLE001
             image_count = 0
-
-        quality = _grade_from_text(page_no, text, image_count)
+        raw_text = page.get_text("text")
+        quality = _grade_from_text(page_no, raw_text, image_count)
         parsed.page_qualities.append(quality)
 
-        if quality.level == "red":
-            # 红页原文不可信：先保留并打标 quality_level=red，由 pipeline 决定
-            # 转录成功→剔除原文块、追加 figure_transcript；转录失败→降级原文入库（R7 不崩）
-            page_blocks = _page_text_to_blocks(text, page_no, repeat_first, repeat_last)
-            for b in page_blocks:
-                b.metadata["quality_level"] = "red"
-            parsed.blocks.extend(page_blocks)
-            continue
+        start_idx = len(parsed.blocks)
 
-        page_blocks = _page_text_to_blocks(text, page_no, repeat_first, repeat_last)
-        parsed.blocks.extend(page_blocks)
+        if quality.level == "red":
+            # 红页：markitdown 救不了，保留 PyMuPDF 原文（质量门已打标）
+            blocks = _page_text_to_blocks(raw_text, page_no, set(), set())
+            for b in blocks:
+                b.metadata["quality_level"] = "red"
+            parsed.blocks.extend(blocks)
+        else:
+            seg = page_md_segments[page_no - 1] if page_md_segments else ""
+            if not seg.strip():
+                # markitdown 该页空输出兜底：退回 PyMuPDF 原文段落
+                blocks = _page_text_to_blocks(raw_text, page_no, set(), set())
+            else:
+                blocks = _parse_markdown_text(seg, DocumentType.PDF,
+                                              recover_cjk_headings=True)
+                for b in blocks:
+                    b.page = page_no
+            parsed.blocks.extend(blocks)
+
+        if len(parsed.blocks) > start_idx:
+            page_ranges.append((start_idx, len(parsed.blocks) - 1))
+        else:
+            page_ranges.append((start_idx, start_idx - 1))  # 空页
+
+    # 页眉页脚剔除（基于每页首/尾块文本：跨 >=3 页重复，或每页都出现）
+    _strip_repeating_headers_footers(parsed.blocks, page_ranges)
 
     doc.close()
     return parsed
+
+
+def _split_markdown_by_page(markdown: str, page_count: int) -> list[str]:
+    """markitdown 整文档 Markdown 按 \f 分页符切成逐页片段。
+
+    markitdown 把多页 PDF 连成一串、用 \\f 分隔；按页切后每段对应一页，
+    便于各自打页码。不足 page_count 段时（末段可能含多余 \\f 或缺失），
+    末段兜底合并剩余内容。
+    """
+    if not markdown:
+        return ["" for _ in range(page_count)]
+    parts = markdown.split("\f")
+    # 去掉每段首尾空白
+    segs = [p.strip("\n") for p in parts]
+    if len(segs) < page_count:
+        # 补齐空串，保证索引对齐页号
+        segs = segs + ["" for _ in range(page_count - len(segs))]
+    elif len(segs) > page_count:
+        # 段数多于页数（异常）：保留前 page_count-1 段，末段合并剩余
+        segs = segs[: page_count - 1] + ["\f".join(segs[page_count - 1:])]
+    return segs
+
+
+def _strip_repeating_headers_footers(blocks: list, page_ranges: list[tuple[int, int]]) -> None:
+    """删除重复出现在页首/页尾的块（页眉/页脚）。原地修改 blocks。
+
+    判定：某块文本作为某页首/尾块出现 >=3 次，或出现在每一页（>=2 页文档）。
+    后者覆盖「短文档每页都有页脚」的情形。
+    """
+    from collections import Counter
+
+    real_pages = [r for r in page_ranges if r[1] >= r[0]]
+    n_pages = len(real_pages)
+    heads = [blocks[s].text for s, _ in real_pages]
+    tails = [blocks[e].text for _, e in real_pages]
+
+    def _repeats(counter: Counter) -> set[str]:
+        out: set[str] = set()
+        for t, c in counter.items():
+            if t and (c >= 3 or (c == n_pages and n_pages >= 2)):
+                out.add(t)
+        return out
+
+    repeat_head = _repeats(Counter(heads))
+    repeat_tail = _repeats(Counter(tails))
+    if not repeat_head and not repeat_tail:
+        return
+
+    drop: set[int] = set()
+    for s, e in real_pages:
+        if blocks[s].text in repeat_head:
+            drop.add(s)
+        if blocks[e].text in repeat_tail:
+            drop.add(e)
+    for i in sorted(drop, reverse=True):
+        blocks.pop(i)
 
 
 def _grade_from_text(page_no: int, text: str, image_count: int):
@@ -329,7 +464,6 @@ def _join_lines(lines: list[str]) -> str:
 # ── 工具 ──────────────────────────────────────────────
 def _collect_table(lines: list[str], i: int):
     """收集从 i 开始的连续 | 行。若含 md 分隔行（|--|--|）判定为表格，否则 None。"""
-    import re
 
     j = i
     while j < len(lines) and lines[j].strip().startswith("|"):
