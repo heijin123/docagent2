@@ -226,7 +226,8 @@ def log_ingest(req_id: str, duration_ms: float, *, doc_id: str = "",
 
 
 def log_kb_gap(req_id: str, query: str, *, rewritten_query: str = "",
-               thread_id: str = "", expired_candidates: int = 0) -> None:
+               thread_id: str = "", expired_candidates: int = 0,
+               reason: str = "") -> None:
     """知识库覆盖缺口线索（event=kb_gap）：检索完全无命中时记录，**每次必记**。
 
     定位（重要，别当成告警）：这只是一条**离线线索**——供知识库管理员把散落的
@@ -247,5 +248,8 @@ def log_kb_gap(req_id: str, query: str, *, rewritten_query: str = "",
         "query": (query or "")[:200],
         "rewritten_query": (rewritten_query or "")[:200],
         "expired_candidates": expired_candidates,
+        # 触发来源：empty_index（索引真空，真无命中）| relevance_gate（F2.10 双证据判定
+        # 不相关——"库里有 A 主题、用户问 B 主题"）。缺口聚类时可据此区分"没入库"与"没覆盖"。
+        "reason": reason,
     }
     logger.info(json.dumps(payload, ensure_ascii=False))

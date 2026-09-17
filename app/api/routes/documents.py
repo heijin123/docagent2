@@ -27,7 +27,8 @@ from app.api.deps import get_request_id, get_services
 from app.api.errors import ApiError
 from app.core.config import settings
 from app.models import SUPPORTED_EXTENSIONS, make_doc_id
-from app.models.api import DocumentMeta, UploadResponse
+from app.models.api import (DocumentListItem, DocumentListResponse, DocumentMeta,
+                            PatchDocumentRequest, PatchDocumentResponse, UploadResponse)
 
 logger = logging.getLogger(__name__)
 
@@ -203,3 +204,65 @@ async def delete_document(doc_id: str, request: Request, response: Response):
     logger.info("软删除 doc_id=%s v%s: vector=%s bm25=%s（重复删除幂等 204）",
                 doc_id, rec.version, vec_flipped, bm_flipped)
     return Response(status_code=http_status.HTTP_204_NO_CONTENT)
+
+
+@router.get("", response_model=DocumentListResponse)
+async def list_documents(
+    request: Request,
+    include_deleted: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """契约 §2.4b：文档列表（分页）。
+
+    为什么必须补这个接口：**没有列表，前端刷新就丢**——上传页只看得到本次会话的任务态，
+    而 DELETE 需要 doc_id、前端根本拿不到。验收标准 12「软删除后前端列表同步」因此
+    无法成立。租户隔离由请求上下文提供（X-Tenant-Id）。
+    """
+    services = get_services(request)
+    tenant_id = request.state.tenant_id
+    safe_limit = max(1, min(int(limit), 200))     # 上限 200，防一次拉全量
+    safe_offset = max(0, int(offset))
+    records, total = services.registry.list_docs(
+        tenant_id, include_deleted=include_deleted,
+        limit=safe_limit, offset=safe_offset)
+    return DocumentListResponse(
+        total=total, limit=safe_limit, offset=safe_offset,
+        items=[DocumentListItem(
+            doc_id=r.doc_id, doc_key=r.doc_key, version=r.version, status=r.status,
+            is_deleted=r.is_deleted, effective_time=r.effective_time,
+            content_hash=r.content_hash, created_at=r.created_at,
+            updated_at=r.updated_at, error=r.error) for r in records],
+    )
+
+
+@router.patch("/{doc_id}", response_model=PatchDocumentResponse)
+async def patch_document(doc_id: str, body: PatchDocumentRequest, request: Request):
+    """契约 §2.4c：设置文档有效期（F2.8）。
+
+    这是 `effective_time` 的**唯一写入口**：此前该字段只有读取方（检索 where 过滤、
+    citation 的 validity），没有任何写入路径 → 过期链路（验收标准 8）代码在、验不了。
+    一次写三处，避免"登记表说有期、索引里还是永久"的漂移：
+      1. Registry（列表展示的权威值）；
+      2. Chroma chunk 元数据（向量路过滤用）；
+      3. BM25 列 + meta_json（词法路过滤与证据渲染用）。
+
+    `effective_time=0` → 永久有效；`now > effective_time` → 该文档转为过期（expired），
+    主检索不再召回，只经 F2.8 二级候选 + 用户确认后可见。
+    """
+    services = get_services(request)
+    tenant_id = request.state.tenant_id
+    rec = services.registry.by_doc_id(tenant_id, doc_id)
+    if rec is None:
+        raise ApiError("DOC_NOT_FOUND", f"doc_id {doc_id} 不存在", 404)
+
+    eff = int(body.effective_time)
+    # 只翻**当前版本**的 chunk：历史版本早已被 is_valid=false，翻它们无意义
+    chunk_ids = services.vector_store.doc_chunk_ids(doc_id, rec.version)
+    services.vector_store.set_metadata(chunk_ids, {"effective_time": eff})
+    services.bm25_store.set_metadata(chunk_ids, {"effective_time": eff})
+    services.registry.set_effective_time(tenant_id, rec.doc_key, eff)
+    logger.info("设置有效期 doc_id=%s v%s effective_time=%s chunks=%s",
+                doc_id, rec.version, eff, len(chunk_ids))
+    return PatchDocumentResponse(doc_id=doc_id, version=rec.version,
+                                 effective_time=eff, chunks_updated=len(chunk_ids))

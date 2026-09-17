@@ -56,6 +56,14 @@ class VectorStore:
         metas = [{k: fields[k] for k in fields} for _ in chunk_ids]
         self._collection.update(ids=chunk_ids, metadatas=metas)
 
+    def doc_chunk_ids(self, doc_id: str, version: int | None = None) -> list[str]:
+        """某文档（可选指定版本）的全部 chunk_id（PATCH 元数据用）。"""
+        where: dict = {"doc_id": {"$eq": doc_id}}
+        if version is not None:
+            where = {"$and": [where, {"version": {"$eq": version}}]}
+        res = self._collection.get(where=where, include=[])
+        return sorted(res["ids"] or [])
+
     def soft_delete_doc(self, doc_id: str, version: int) -> int:
         """F1.7：某文档某版本全部 chunk 翻 is_valid=false（先插新后翻旧保证无空窗）。"""
         hits = self._collection.get(

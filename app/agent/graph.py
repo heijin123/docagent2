@@ -100,9 +100,12 @@ def build_qa_graph(
         # 确定性短路（成本关键）：现行 + 过期都没命中 → 直接走"无资料"披露，**0 次 LLM**。
         # 旧设计此时会白烧 answer + verify 两轮再转人工；现在既省钱，也不把知识库的
         # 覆盖缺口甩成人工负担。
+        # 两种情况都短路：① 检索真无命中（索引真空）；② F2.10 双证据判定「无相关内容」
+        # （有候选但既无词表覆盖也无语义相近）——后者是本路由的主要来源，因为向量检索
+        # 恒返回 topN，① 几乎不会发生。
         if state.get("confirmation_needed"):
             return "answer"          # F2.8 仅命中过期 → 先走确认话术
-        if not state.get("retrieved"):
+        if state.get("no_relevant") or not state.get("retrieved"):
             return "no_data"
         return "answer"
 

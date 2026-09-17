@@ -239,6 +239,10 @@ class _RetrievalResult:
         "validity": "valid",
     }]
     expired_candidates = []
+    # 2026-09-17：检索结果新增字段（F2.10 相关性判定 / 需求 7.1 邻近上下文），替身同步
+    context_items = []
+    relevance = {}
+    no_relevant = False
     notes = []
     degraded = False
 

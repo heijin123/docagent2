@@ -11,6 +11,11 @@
               现行不足 → 顺序发起二级候选（仅放宽 effective_time，不动 is_valid/permission）；
 - F2.9       年份感知两段式裁决（query 显式年份 → doc_year 过滤检索；
               过滤命中与语义 top1 同 doc_id 才采用，否则回退语义结果 + note）。
+- F2.10      相关性判定（`relevance`）：「库里到底有没有相关内容」——向量恒返回 topN，
+              需显式判无相关资料才能走 no_data（0 LLM），见 app/retrieval/relevance.py。
+- 需求 7.1   邻近 chunk 上下文扩展（`context_items`）：命中块被切在段落/条款边界时补齐
+              相邻块。**刻意与 `items` 分开放**——命中口径与评估指标（recall@5 读 items）
+              不能被上下文掺水。
 
 同步入口 `retrieve()` 供 M3 LangGraph 节点直接调用；
 异步入口 `aretrieve()` 供 M4 SSE 层调用（两路真并行）。
@@ -27,6 +32,7 @@ from app.core.observability import TimedSpan, log_slow_query
 from app.models import now_ts
 from app.retrieval.bm25store import BM25Store
 from app.retrieval.embedding import Embedder, build_embedder
+from app.retrieval.relevance import get_relevance_gate
 from app.retrieval.vectorstore import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -39,6 +45,18 @@ FINAL_TOPN = 8
 PERMISSION_LEVEL = {"public": 0, "internal": 1, "secret": 2}
 
 YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
+_CHUNK_ID_RE = re.compile(r"^(?P<doc>.+)_(?P<ver>\d{4})_(?P<idx>\d{5})$")
+
+
+def parse_chunk_id(chunk_id: str) -> tuple[str, int, int] | None:
+    """chunk_id = f"{doc_id}_{version:04d}_{index:05d}" → (doc_id, version, index)。
+
+    doc_id 形如 `doc_<12hex>`（自身不含下划线），故从右往左切两段即可，无需额外索引。
+    """
+    m = _CHUNK_ID_RE.match(chunk_id or "")
+    if not m:
+        return None
+    return m.group("doc"), int(m.group("ver")), int(m.group("idx"))
 
 
 @dataclass
@@ -48,6 +66,8 @@ class HybridResult:
     query: str
     items: list[dict] = field(default_factory=list)          # 现行结果（最终采用）
     expired_candidates: list[dict] = field(default_factory=list)  # 二级候选：仅过期命中
+    context_items: list[dict] = field(default_factory=list)  # 需求 7.1 邻近上下文（非命中）
+    relevance: dict = field(default_factory=dict)            # F2.10 相关性判定结果
     notes: list[str] = field(default_factory=list)           # F2.9 回退 / F2.8 降级说明
     degraded: list[dict] = field(default_factory=list)       # [{path, error}]
     used_roads: list[str] = field(default_factory=list)      # 实际参与融合的路
@@ -57,6 +77,11 @@ class HybridResult:
     def only_expired(self) -> bool:
         """主检索现行不足且仅命中过期文档 → Agent 走 F2.8 提示话术。"""
         return not self.items and bool(self.expired_candidates)
+
+    @property
+    def no_relevant(self) -> bool:
+        """F2.10：库里没有与问题相关的内容（双证据判定，高精度）。"""
+        return bool(self.relevance.get("no_relevant"))
 
 
 def allowed_permissions(user_permission: str) -> list[str]:
@@ -275,6 +300,83 @@ class HybridRetriever:
         return {"vector_hits": vh, "bm25_hits": bh, "fused": fused,
                 "degraded": degraded, "used_roads": used, "now": now}
 
+    # ── F2.10 相关性判定：库里到底有没有相关内容 ────────────────
+    def _assess_relevance(self, query: str, base: dict) -> dict:
+        """基于**语义基准路**判定（年份过滤/二级候选都不该改变"有没有相关内容"）。
+
+        判定逻辑与标定见 app/retrieval/relevance.py；此处只负责取信号与落 note。
+
+        护栏：`provider=mock` 或 `degraded` 时**不判**——mock 是哈希向量，余弦分数没有
+        语义含义（合约测试/无 Key 降级环境都走这条路）。此时若照常判定，会因"相似度
+        恒低"把**库里有答案的问题**判成无资料（真实误杀）。宁可让本能力在 mock 下失效。
+        """
+        prov = (getattr(self.embedder, "provider", "") or "").lower()
+        if getattr(self.embedder, "degraded", False) or prov == "mock":
+            return {"no_relevant": False, "coverage": None, "top_vector_score": None,
+                    "absent_terms": [],
+                    "reason": f"向量 provider={prov or '?'}/degraded（相似度无语义）→ 不判"}
+        try:
+            gate = get_relevance_gate(self.bm25_store)
+            return gate.assess(query, base.get("vector_hits") or [])
+        except Exception as exc:  # noqa: BLE001 — 判定失败绝不阻断检索
+            logger.warning("相关性判定失败，跳过（不影响检索）: %s", exc)
+            return {"no_relevant": False, "coverage": None, "top_vector_score": None,
+                    "absent_terms": [], "reason": f"判定异常跳过: {exc}"}
+
+    # ── 需求 7.1 邻近 chunk 上下文扩展 ─────────────────────────
+    def _expand_context(self, items: list[dict], *, user_permission: str,
+                        now: int) -> list[dict]:
+        """取前 N 条命中在同文档同版本内的 chunk_index ±1 邻块，作为**上下文**返回。
+
+        与 `items` 分开返回的理由（重要）：
+        - 评估指标（recall@5 / MRR）读的是 `items`，掺入邻居会让指标虚高、与历史基线不可比；
+        - 邻居是"补全语义"而非"命中证据"，口径要能区分。
+
+        护栏：预算 top-3×±1、总量 `context_expand_max`；跳过过期邻块（避免把过期内容
+        当上下文引进来）；强制 tenant + permission 隔离（BM25Store.get_by_chunk_ids）。
+        """
+        if not settings.context_expand_enabled or not items:
+            return []
+        wanted: dict[tuple[str, int], set[int]] = {}
+        for it in items[: max(1, settings.context_expand_top)]:
+            parsed = parse_chunk_id(it.get("chunk_id", ""))
+            if not parsed:
+                continue
+            doc_id, ver, idx = parsed
+            for nb in (idx - 1, idx + 1):
+                if nb >= 1:
+                    wanted.setdefault((doc_id, ver), set()).add(nb)
+        if not wanted:
+            return []
+        want_ids = [f"{d}_{v:04d}_{i:05d}" for (d, v), idxs in wanted.items() for i in idxs]
+        try:
+            rows = self.bm25_store.get_by_chunk_ids(
+                want_ids, tenant_id=self.tenant_id,
+                allowed_permissions=allowed_permissions(user_permission))
+        except Exception as exc:  # noqa: BLE001 — 扩展失败不影响主检索
+            logger.warning("邻近 chunk 扩展失败（忽略）: %s", exc)
+            return []
+
+        have = {it.get("chunk_id") for it in items}
+        out: list[dict] = []
+        for row in rows:
+            cid = row["chunk_id"]
+            if cid in have:
+                continue
+            meta = dict(row["metadata"])
+            eff = meta.get("effective_time") or 0
+            if eff and eff < now:
+                continue  # 过期邻块不进上下文（避免混淆现行结论）
+            have.add(cid)
+            out.append({
+                "chunk_id": cid, "content": row["content"], "metadata": meta,
+                "ranks": {"vector": None, "bm25": None}, "sources": ["context"],
+                "validity": "valid", "expired_at": None, "score": 0.0, "is_context": True,
+            })
+            if len(out) >= max(0, settings.context_expand_max):
+                break
+        return out
+
     # ── 公开入口 ───────────────────────────────────────────────
     def retrieve(
         self, query: str, *, top_n: int | None = None,
@@ -296,10 +398,16 @@ class HybridRetriever:
         result.detail["baseline"] = {
             "vector_hits": base["vector_hits"], "bm25_hits": base["bm25_hits"],
         }
+        # F2.10：先判「有没有相关内容」——它为真时下方二级候选无需再发（话题都不在库里，
+        # 过期候选同样不相关），也由它决定是否走 no_data 出口（0 LLM）。
+        result.relevance = self._assess_relevance(query, base)
+        if result.no_relevant:
+            result.notes.append(
+                f"相关性判定：无相关内容（{result.relevance['reason']}）→ 应如实告知缺失")
 
         # F2.9 两段式裁决：显式年份 → 过滤检索；命中与语义 top1 同 doc 才采用
         years = sorted({int(y) for y in YEAR_RE.findall(query)})
-        if years:
+        if years and not result.no_relevant:
             filtered = self._search_once(
                 query, include_expired=False, doc_years=years,
                 category=category, department=department,
@@ -326,7 +434,7 @@ class HybridRetriever:
         # 顺序放宽 effective_time 取过期候选（无现行可答，直接给出确认分支所需信息）。
         # 注意：语义检索恒返回 topN（无距离阈值），"现行不足"的常规判定发生在调用方
         # （Answer/Generate 节点看到证据不足）→ 由其显式调 relaxed_retrieve() 发起二级候选。
-        if not result.items:
+        if not result.items and not result.no_relevant:
             relaxed = self._search_once(
                 query, include_expired=True, category=category,
                 department=department, user_permission=user_permission, now=now,
@@ -340,6 +448,13 @@ class HybridRetriever:
                 "vector_hits": relaxed["vector_hits"], "bm25_hits": relaxed["bm25_hits"]}
             result.degraded.extend(relaxed["degraded"])
             result.used_roads = relaxed["used_roads"] or result.used_roads
+
+        # 需求 7.1：命中块可能被切在段落/条款边界 → 补同文档相邻块作上下文
+        result.context_items = self._expand_context(
+            result.items, user_permission=user_permission, now=now)
+        if result.context_items:
+            result.notes.append(
+                f"邻近上下文：补入 {len(result.context_items)} 条相邻块（非命中，仅供补全语义）")
         duration_ms = span.stop(log_slow=False)
         log_slow_query("", query, duration_ms,
                        used_roads=result.used_roads, hits=len(result.items))
@@ -376,6 +491,9 @@ class HybridRetriever:
                 "答案须带失效提示")
         result.detail["baseline"] = {
             "vector_hits": res["vector_hits"], "bm25_hits": res["bm25_hits"]}
+        result.relevance = self._assess_relevance(query, res)
+        result.context_items = self._expand_context(
+            result.items, user_permission=user_permission, now=now)
         return result
 
     async def arelaxed_retrieve(
@@ -398,6 +516,9 @@ class HybridRetriever:
             [i for i in res["fused"] if i["validity"] != "expired"], top_n)
         if expired:
             result.notes.append("命中过期文档（validity=expired）→ 需用户确认后查看")
+        result.relevance = self._assess_relevance(query, res)
+        result.context_items = self._expand_context(
+            result.items, user_permission=user_permission, now=now)
         return result
 
     async def aretrieve(
@@ -418,9 +539,13 @@ class HybridRetriever:
         result.items = self._trim(base["fused"], top_n)
         result.detail["baseline"] = {
             "vector_hits": base["vector_hits"], "bm25_hits": base["bm25_hits"]}
+        result.relevance = self._assess_relevance(query, base)
+        if result.no_relevant:
+            result.notes.append(
+                f"相关性判定：无相关内容（{result.relevance['reason']}）→ 应如实告知缺失")
 
         years = sorted({int(y) for y in YEAR_RE.findall(query)})
-        if years:
+        if years and not result.no_relevant:
             filtered = await self._search_once_async(
                 query, include_expired=False, doc_years=years,
                 category=category, department=department,
@@ -439,7 +564,7 @@ class HybridRetriever:
         else:
             result.detail["year_filtered"] = False
 
-        if not result.items:
+        if not result.items and not result.no_relevant:
             relaxed = await self._search_once_async(
                 query, include_expired=True, category=category,
                 department=department, user_permission=user_permission, now=now,
@@ -449,6 +574,12 @@ class HybridRetriever:
             if result.expired_candidates:
                 result.notes.append("现行资料不足，命中过期文档 → 需用户确认后查看")
             result.degraded.extend(relaxed["degraded"])
+
+        result.context_items = self._expand_context(
+            result.items, user_permission=user_permission, now=now)
+        if result.context_items:
+            result.notes.append(
+                f"邻近上下文：补入 {len(result.context_items)} 条相邻块（非命中，仅供补全语义）")
         duration_ms = span.stop(log_slow=False)
         log_slow_query("", query, duration_ms,
                        used_roads=result.used_roads, hits=len(result.items))

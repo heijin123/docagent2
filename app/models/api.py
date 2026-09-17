@@ -41,7 +41,12 @@ class ChatRequest(BaseModel):
 
 # ── §2.2 /v1/documents 上传 ────────────────────────────────
 class DocumentMeta(BaseModel):
-    """meta 表单 JSON。permission 刻意不入模型 → 客户端传入被忽略（防提权，§1.3）。"""
+    """meta 表单 JSON。permission 刻意不入模型 → 客户端传入被忽略（防提权，§1.3）。
+
+    `effective_time`（F2.8 有效期）**刻意不在此处**：上传是异步任务，元数据要穿透
+    任务队列写入每个 chunk，风险与改动面都大；有效期改用 **PATCH /v1/documents/{doc_id}**
+    单一写入口（登记表 + 双索引 chunk 元数据一次写全，避免两处漂移）。
+    """
     doc_key: str | None = None
     department: str | None = None
     category: str | None = None
@@ -53,6 +58,40 @@ class UploadResponse(BaseModel):
     version: int
     status: str = "pending"          # pending / processing / done / failed
     duplicated: bool = False
+
+
+# ── §2.4b GET /v1/documents 列表（2026-09-17 补）────────────
+class DocumentListItem(BaseModel):
+    doc_id: str
+    doc_key: str
+    version: int
+    status: str = "done"             # pending / processing / done / failed
+    is_deleted: bool = False
+    effective_time: int = 0          # 0 = 永久有效（F2.8）
+    content_hash: str = ""
+    created_at: int = 0
+    updated_at: int = 0
+    error: str | None = None
+
+
+class DocumentListResponse(BaseModel):
+    total: int = 0                   # 过滤后总数（分页前的分母）
+    limit: int = 50
+    offset: int = 0
+    items: list[DocumentListItem] = Field(default_factory=list)
+
+
+# ── §2.4c PATCH /v1/documents/{doc_id}（2026-09-17 补）──────
+class PatchDocumentRequest(BaseModel):
+    effective_time: int = Field(
+        ge=0, description="有效期截止 Unix 秒；0 = 永久有效（F2.8）")
+
+
+class PatchDocumentResponse(BaseModel):
+    doc_id: str
+    version: int
+    effective_time: int
+    chunks_updated: int = 0          # 同步翻新的 chunk 数（向量 + BM25 双索引）
 
 
 # ── §2.3 任务状态 ──────────────────────────────────────────

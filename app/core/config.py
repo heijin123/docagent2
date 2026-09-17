@@ -127,6 +127,27 @@ class Settings:
     vlm_enabled: bool = field(default_factory=lambda: _env_bool("VLM_ENABLED", False))
     qwen_vlm_model: str = field(default_factory=lambda: _env("QWEN_VLM_MODEL", "qwen-vl-max"))
 
+    # ── 检索相关性判定（F2.10，2026-09-17）──────────────────
+    # 向量检索恒返回 topN，无距离阈值 → 库里没资料时也给回"最像的 8 条"，
+    # 导致 no_data（0 LLM 如实告知缺失）只在索引真空时触发。这里用
+    # 「词表覆盖 + 语义相似」双证据做**高精度短路**（标定见 app/retrieval/relevance.py）。
+    # 默认值来自 2026-09-17 实测：golden 55 条全保留（零误杀）、语料不覆盖的 12 条里判出 4 条
+    # （"话题完全不在库里"那一类）。**误杀比漏判严重得多**，调参请勿放松这两个条件之一。
+    retrieval_min_coverage: float = field(
+        default_factory=lambda: float(_env("RETRIEVAL_MIN_COVERAGE", "0.20")))
+    retrieval_min_similarity: float = field(
+        default_factory=lambda: float(_env("RETRIEVAL_MIN_SIMILARITY", "0.40")))
+
+    # ── 邻近 chunk 上下文扩展（需求 7.1，2026-09-17）─────────
+    # 命中的 chunk 可能被切在段落/条款边界（chunk_index 相邻块是同一段落的续），
+    # 取邻居块拼入**上下文**（不参与检索指标与命中口径，见 HybridResult.context_items）。
+    # 预算刻意收紧：邻居会进 answer 的 evidence（prompt 大头），top-3 命中 × ±1 邻块、
+    # 去重后最多 4 条 ≈ +500 tok/问。
+    context_expand_enabled: bool = field(
+        default_factory=lambda: _env_bool("CONTEXT_EXPAND_ENABLED", True))
+    context_expand_top: int = field(default_factory=lambda: _env_int("CONTEXT_EXPAND_TOP", 3))
+    context_expand_max: int = field(default_factory=lambda: _env_int("CONTEXT_EXPAND_MAX", 4))
+
     # ── Redis checkpointer（F4.1，M3）──────────────────────
     redis_url: str = field(default_factory=lambda: _env("REDIS_URL", "redis://localhost:6379/0"))
     redis_checkpointer_enabled: bool = field(

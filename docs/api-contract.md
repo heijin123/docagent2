@@ -181,6 +181,55 @@ SSE 通道内发生错误时 **HTTP 状态保持 200**，通过 `error` 事件�
 - 成功 / 重复删除（幂等）→ **204**；doc_id 不存在 → 404 `DOC_NOT_FOUND`
 - 异步翻状态，返回 204 不代表立即对检索生效；对"删除后立刻查询"的场景允许短暂延迟（最终一致）
 
+### 2.4b GET /v1/documents — 文档列表（2026-09-17 补）
+
+```
+?include_deleted=false&limit=50&offset=0   (limit 上限 200)
+```
+
+```json
+{
+  "total": 38,
+  "limit": 50,
+  "offset": 0,
+  "items": [
+    {"doc_id": "doc_9f3a1b2c3d4e", "doc_key": "policy_after_sales_return.pdf",
+     "version": 3, "status": "done", "is_deleted": false, "effective_time": 0,
+     "content_hash": "ab12…", "created_at": 1751241600, "updated_at": 1751241700,
+     "error": null}
+  ]
+}
+```
+
+| 参数 | 说明 |
+|---|---|
+| include_deleted | 默认 `false` = 前端列表口径（不含已软删）；`true` = 审计/回收站口径 |
+| total | **过滤后总数**（分页前的分母），前端据此渲染分页器 |
+| status | `pending / processing / done / failed`（与 §2.3、4.7 同一枚举） |
+| effective_time | 0 = 永久有效；`now > effective_time` → 已过期（F2.8） |
+
+**为什么必须有这个接口**：此前 `/v1/documents` 只有 POST / DELETE——前端**刷新即丢**
+（只看得到本次会话的任务态），而 DELETE 需要 `doc_id`，前端根本拿不到它。验收标准 12
+「软删除后前端列表同步」因此无法成立。排序：`updated_at DESC, doc_key ASC`（最近操作在前、
+同秒稳定）。
+
+### 2.4c PATCH /v1/documents/{doc_id} — 设置有效期（2026-09-17 补）
+
+```json
+请求：{"effective_time": 1751241600}    // 0 = 永久有效
+响应：{"doc_id": "doc_9f3a…", "version": 3, "effective_time": 1751241600,
+       "chunks_updated": 3}
+```
+
+- 404 `DOC_NOT_FOUND`（doc_id 不存在）；`effective_time < 0` → 422
+- 这是 `effective_time` 的**唯一写入口**：此前该字段只有读取方（检索 where 过滤、citation
+  的 `validity`），**没有任何写入路径** → F2.8 过期链路（验收标准 8）代码在、验不了
+- 一次写三处，避免"登记表说有期、索引里还是永久"的漂移：① Registry（列表权威值）、
+  ② Chroma chunk 元数据（向量路过滤）、③ BM25 列 + `meta_json`（词法路过滤与证据渲染）
+- 只翻**当前版本**的 chunk（历史版本已 `is_valid=false`，翻它们无意义）
+- 见效时机：`now > effective_time` 后主检索不再召回该文档，仅在 F2.8 二级候选
+  （`relaxed_retrieve`）中出现为 `validity=expired`，需用户确认后才可见
+
 ### 2.5 GET /v1/threads/{thread_id}/history — 对话历史
 
 ```

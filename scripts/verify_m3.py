@@ -124,10 +124,17 @@ class LowConfLLM(StubLLM):
 
 
 class _EmptyResult:
-    """恒空命中结果（验收"检索为空 → no_data"）。"""
+    """恒空命中结果（验收"检索为空 → no_data"）。
+
+    `no_relevant` / `context_items` 是 2026-09-17 新增的检索结果字段（F2.10 相关性判定 /
+    需求 7.1 邻近上下文），替身必须同步——节点直接按属性访问，缺字段会 AttributeError。
+    """
 
     items: list = []
     expired_candidates: list = []
+    context_items: list = []
+    relevance: dict = {}
+    no_relevant: bool = False
     notes: list = []
     degraded = False
 

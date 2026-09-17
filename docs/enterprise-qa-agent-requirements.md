@@ -446,6 +446,8 @@ stateDiagram-v2
 | F5.5 | `GET /health`：健康检查（含 Redis、向量库连通性） | P0 |
 | F5.6 | 统一异常处理：业务错误返回结构化 error body，不暴露堆栈 | P0 |
 | F5.7 | `DELETE /v1/documents/{doc_id}`：软删除文档（对应 F1.6，重复删除幂等返回 204） | P1 |
+| F5.9 | `GET /v1/documents`：文档列表（分页 + `include_deleted`；支撑验收标准 12「软删除后前端列表同步」——此前无列表接口，前端刷新即丢且拿不到 DELETE 所需 doc_id） | P1 |
+| F5.10 | `PATCH /v1/documents/{doc_id}`：设置文档有效期 `effective_time`（F2.8 的**唯一写入口**；此前该字段只有读取方，过期链路代码在、验不了，对应验收标准 8） | P1 |
 | F5.8 | `POST /v1/debug/retrieve`：检索调试（返回双路明细 + RRF 融合结果，仅供开发） | P1 |
 
 ### F6 异步与并发

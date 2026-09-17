@@ -83,6 +83,7 @@ class QANodes:
             "retrieved": [],
             "expired_candidates": [],
             "confirmation_needed": False,
+            "no_relevant": False,
             "citations": [],
             "answer": "",
             "grounded": False,
@@ -137,25 +138,36 @@ class QANodes:
         return {"rewritten_query": rewritten, "include_expired": include_expired,
                 "notes": new_notes}
 
-    # ── F3.3 retrieve（F2 混合检索 + F2.8 确认分支标记）────────
+    # ── F3.3 retrieve（F2 混合检索 + F2.8 确认分支标记 + F2.10 无相关内容判定）──
     def retrieve(self, state: AgentState) -> dict:
         q = state.get("rewritten_query") or state["query"]
         include_expired = bool(state.get("include_expired"))
+        no_relevant = False
         if include_expired:
             res = self.retriever.relaxed_retrieve(q, user_permission=self.user_permission)
             retrieved = [*res.items, *res.expired_candidates]
             confirmation_needed = False
         else:
             res = self.retriever.retrieve(q, user_permission=self.user_permission)
-            retrieved = res.items
-            # 仅当"现行一无所有且存在过期候选"才进入确认话术（F2.8 提示流程）
-            confirmation_needed = (not res.items) and bool(res.expired_candidates)
+            # F2.10：库里没有相关内容（双证据判定，高精度）→ 视为无命中，走 no_data 出口
+            # （0 次 LLM）。此前这里恒非空（向量无距离阈值），只能烧 answer+verify 两轮
+            # 靠模型自觉说"资料不足"，把机制问题甩给模型。
+            no_relevant = res.no_relevant
+            if no_relevant:
+                retrieved = []
+                confirmation_needed = False
+            else:
+                # 需求 7.1：命中块 + 相邻块上下文（上下文只补语义，不进命中口径）
+                retrieved = [*res.items, *res.context_items]
+                # 仅当"现行一无所有且存在过期候选"才进入确认话术（F2.8 提示流程）
+                confirmation_needed = (not res.items) and bool(res.expired_candidates)
         new_notes = [*state.get("notes", []), *res.notes]
         if res.degraded:
             new_notes.append("检索降级: " + ", ".join(d["path"] for d in res.degraded))
         return {"retrieved": retrieved,
                 "expired_candidates": res.expired_candidates,
                 "confirmation_needed": confirmation_needed,
+                "no_relevant": no_relevant,
                 "notes": new_notes}
 
     # ── F3.4 answer（合并 supervisor：意图分类 + 生成回答，单次 LLM）──
@@ -315,19 +327,24 @@ class QANodes:
         "config" 这个参数名本身就是注入契约。
         """
         conf = (config or {}).get("configurable", {}) or {}
+        # 两类触发来源要能分辨（供离线缺口聚类）：索引真空（检索真无命中）vs
+        # F2.10 双证据判定（有候选但判定不相关）——后者才是"库里有 A 主题、用户问 B 主题"。
+        reason = "relevance_gate" if state.get("no_relevant") else "empty_index"
         log_kb_gap(
             str(conf.get("request_id", "") or ""),
             state.get("query", ""),
             rewritten_query=state.get("rewritten_query", ""),
             thread_id=str(conf.get("thread_id", "") or ""),
             expired_candidates=len(state.get("expired_candidates", []) or []),
+            reason=reason,
         )
         if self.token_sink:
             self.token_sink(_NO_DATA_MSG)  # 非 LLM 路径也放 token，保持前端拼接一致
+        trigger = ("相关性判定无相关内容" if reason == "relevance_gate" else "检索无命中")
         return {"answer": _NO_DATA_MSG, "citations": [], "degraded": True,
                 "intent": "kb_qa",
                 "notes": [*state.get("notes", []),
-                          "资料不足：检索无命中 → 如实告知缺失（不转人工）"]}
+                          f"资料不足：{trigger} → 如实告知缺失（不转人工，0 LLM）"]}
 
     def disclose(self, state: AgentState) -> dict:
         """verify 用尽仍不达标 → 保留答案 + 确定性披露后缀（不转人工）。

@@ -28,6 +28,7 @@ class AgentState(TypedDict, total=False):
     retrieved: list[dict]              # 现行融合命中（含 metadata / validity / expired_at）
     expired_candidates: list[dict]     # F2.8 二级候选（仅过期）
     confirmation_needed: bool          # 仅命中过期 → 先向用户确认再查看
+    no_relevant: bool                  # F2.10：双证据判定「库里没有相关内容」→ 走 no_data（0 LLM）
     # 生成与校验
     citations: list[dict]              # [{chunk_id, doc_title, page_num, validity, expired_at?, doc_date?}]
     answer: str

@@ -119,6 +119,74 @@ class BM25Store:
             )
         return cur.rowcount
 
+    def get_by_chunk_ids(self, chunk_ids: list[str], *,
+                         tenant_id: str | None = None,
+                         allowed_permissions: list[str] | None = None) -> list[dict]:
+        """按 chunk_id 精确取块（邻近上下文扩展用，F2.10/需求 7.1）。
+
+        只返回 `is_valid=1`，并强制与检索路**同一套隔离**（tenant_id + permission 白名单）
+        ——邻居块同样不能越权泄漏。返回形状与 `search()` 一致（bm25_score=0.0）。
+        """
+        if not chunk_ids:
+            return []
+        sql = "SELECT chunk_id, doc_id, content, meta_json FROM bm25_corpus WHERE is_valid=1"
+        params: list = []
+        sql += f" AND chunk_id IN ({', '.join('?' * len(chunk_ids))})"
+        params.extend(chunk_ids)
+        if tenant_id:
+            sql += " AND tenant_id=?"
+            params.append(tenant_id)
+        if allowed_permissions:
+            sql += f" AND permission IN ({', '.join('?' * len(allowed_permissions))})"
+            params.extend(allowed_permissions)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [{"chunk_id": r["chunk_id"], "content": r["content"],
+                 "metadata": json.loads(r["meta_json"] or "{}"), "bm25_score": 0.0}
+                for r in rows]
+
+    def doc_chunk_ids(self, doc_id: str, version: int | None = None) -> list[str]:
+        """某文档（可选指定版本）的全部 chunk_id（PATCH 元数据用）。"""
+        sql = "SELECT chunk_id FROM bm25_corpus WHERE doc_id=?"
+        params: list = [doc_id]
+        if version is not None:
+            sql += " AND version=?"
+            params.append(version)
+        sql += " ORDER BY chunk_id"
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [r["chunk_id"] for r in rows]
+
+    def set_metadata(self, chunk_ids: list[str], fields: dict) -> int:
+        """按 chunk_id 批量更新可过滤元数据列（F2.8 有效期设置，与向量侧对齐）。
+
+        只接受白名单列，避免任意列写坏库；未登记列直接忽略（调用方不必知道 schema）。
+        """
+        allowed = {"effective_time", "category", "department", "permission"}
+        cols = [c for c in fields if c in allowed]
+        if not chunk_ids or not cols:
+            return 0
+        # meta_json 与列必须同步（检索过滤走列，citation/证据走 meta_json）
+        with self._connect() as conn:
+            n = 0
+            for cid in chunk_ids:
+                row = conn.execute(
+                    "SELECT meta_json FROM bm25_corpus WHERE chunk_id=?", (cid,)
+                ).fetchone()
+                if row is None:
+                    continue
+                meta = json.loads(row["meta_json"] or "{}")
+                meta.update({c: fields[c] for c in cols})
+                sets = ", ".join(f"{c}=?" for c in cols)
+                conn.execute(
+                    f"UPDATE bm25_corpus SET {sets}, meta_json=?, updated_at=? "
+                    "WHERE chunk_id=?",
+                    (*[fields[c] for c in cols], json.dumps(meta, ensure_ascii=False),
+                     now_ts(), cid),
+                )
+                n += 1
+        return n
+
     def rebuild(self):
         """全量重建索引（兼容入口：等价 search 不带过滤，供 pipeline / health 用）。"""
         self._build_from_sql("", ())
